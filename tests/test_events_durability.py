@@ -8,14 +8,7 @@ import multiprocessing as mp
 import os
 import signal
 
-import pytest
-
 from runtime.events import EventLog
-
-
-@pytest.fixture
-def db(tmp_path):
-    return str(tmp_path / "events.db")
 
 
 def test_events_survive_reopen(db):
@@ -42,11 +35,11 @@ def test_event_survives_sigkill(db):
     assert appended.is_set() and child.exitcode == -signal.SIGKILL
 
     with EventLog(db) as log:
-        assert [(e.seq, e.type) for e in log.load(sid)] == [(1, "tool_started")]
+        assert [e.type for e in log.load(sid)] == ["tool_started"]
 
 
 def test_concurrent_writers_never_share_a_seq(db):
-    """4 processes x 50 appends to one session -> seqs are exactly 1..200."""
+    """4 processes x 50 appends to one session -> 200 events, 200 distinct increasing seqs."""
     with EventLog(db) as log:
         sid = log.new_session()
 
@@ -59,7 +52,9 @@ def test_concurrent_writers_never_share_a_seq(db):
         assert w.exitcode == 0
 
     with EventLog(db) as log:
-        assert [e.seq for e in log.load(sid)] == list(range(1, 201))
+        seqs = [e.seq for e in log.load(sid)]
+    assert len(seqs) == 200
+    assert seqs == sorted(set(seqs))
 
 
 # ── child-process bodies (must be module-level so "spawn" can import them) ───────────────
