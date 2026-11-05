@@ -8,7 +8,7 @@ restarted process recovers exactly where the previous one stopped.
 Event types and payloads:
 
     user_message       {text}
-    assistant_message  {text, tool_calls: [{id, name, arguments}]}
+    assistant_message  {text, reasoning?, tool_calls: [{id, name, arguments, arguments_error?}]}
     tool_started       {call_id}
     tool_finished      {call_id, output, is_error}
 
@@ -87,7 +87,12 @@ def _on_assistant_message(state: SessionState, event: Event) -> None:
     """Add the model's reply and register each tool call it made as REQUESTED."""
     _require_no_open_calls(state, event)
     calls = tuple(
-        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+        ToolCall(
+            id=c["id"],
+            name=c["name"],
+            arguments=c["arguments"],
+            arguments_error=c.get("arguments_error"),
+        )
         for c in event.payload.get("tool_calls", [])
     )
     for call in calls:
@@ -97,7 +102,12 @@ def _on_assistant_message(state: SessionState, event: Event) -> None:
         state.tool_calls[call.id] = tool
         state.open_calls[call.id] = tool
     state.messages.append(
-        Message(role="assistant", text=event.payload.get("text", ""), tool_calls=calls)
+        Message(
+            role="assistant",
+            text=event.payload.get("text", ""),
+            reasoning=event.payload.get("reasoning", ""),
+            tool_calls=calls,
+        )
     )
 
 

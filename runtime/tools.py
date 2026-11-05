@@ -1,9 +1,9 @@
 """Tool registry: the tools a session may use, and running one tool call safely.
 
 A tool is a name, a description, a JSON schema for its arguments, and a Python function.
-`ToolRegistry.run()` never raises for a bad call: an unknown tool, arguments that fail the
-schema, or an exception inside the tool all come back as an error result, which the model
-sees and can recover from.
+`ToolRegistry.run()` never raises for a bad call: an unknown tool, arguments that are not
+valid JSON or fail the schema, or an exception inside the tool all come back as an error
+result, which the model sees and can recover from.
 """
 
 from __future__ import annotations
@@ -51,6 +51,9 @@ class ToolRegistry:
         tool = self._tools.get(call.name)
         if tool is None:
             return ToolResult(f"unknown tool {call.name!r}", is_error=True)
+        if call.arguments_error:
+            message = f"invalid arguments for {call.name}: {call.arguments_error}"
+            return ToolResult(message, is_error=True)
         try:
             jsonschema.validate(call.arguments, tool.input_schema)
         except jsonschema.ValidationError as e:

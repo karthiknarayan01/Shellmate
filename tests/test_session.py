@@ -55,6 +55,13 @@ def test_tool_errors_go_back_to_the_model_and_the_turn_continues(log):
     assert result.is_error and "unknown tool" in result.text
 
 
+def test_reasoning_is_kept_for_the_next_request(log):
+    thinking_call = ModelReply(reasoning="need the tool", tool_calls=(ToolCall("c1", "echo", {"text": "x"}),))
+    model = FakeModel([thinking_call, say("done")])
+    Session.create(log, model, ToolRegistry([_echo()])).run_turn("go")
+    assert model.requests[1].messages[1].reasoning == "need the tool"
+
+
 def test_tools_are_offered_to_the_model(log):
     model = FakeModel([say("ok")])
     Session.create(log, model, ToolRegistry([_echo()])).run_turn("hi")

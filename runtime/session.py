@@ -88,6 +88,7 @@ class Session:
             "assistant_message",
             {
                 "text": reply.text,
+                "reasoning": reply.reasoning,
                 "tool_calls": [asdict(c) for c in reply.tool_calls],
                 "usage": asdict(reply.usage),
             },

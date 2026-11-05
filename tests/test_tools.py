@@ -45,6 +45,11 @@ def test_failures_are_error_results_not_exceptions(registry, call, message):
     assert result.is_error and message in result.output
 
 
+def test_arguments_the_model_could_not_encode_are_an_error_result(registry):
+    result = registry.run(ToolCall("c", "add", {}, arguments_error="not valid JSON: '{\"a\": '"))
+    assert result.is_error and "not valid JSON" in result.output
+
+
 def test_duplicate_names_are_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         ToolRegistry([Tool("x", "", {}, str), Tool("x", "", {}, str)])
