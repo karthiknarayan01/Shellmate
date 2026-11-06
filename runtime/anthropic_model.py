@@ -12,20 +12,27 @@ from typing import Any
 import anthropic
 
 from runtime.messages import Message, ToolCall
-from runtime.model import ModelReply, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelReply, ToolSpec, Usage
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+# Above this, the SDK refuses non-streaming requests (they could run past 10 minutes).
+MAX_NON_STREAMING_TOKENS = 21_333
 
 
 class AnthropicModel:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
-        max_tokens: int = 4096,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         max_retries: int = 3,
         client: anthropic.Anthropic | None = None,
     ):
         """`client` defaults to one reading ANTHROPIC_API_KEY from the environment."""
+        if max_tokens > MAX_NON_STREAMING_TOKENS:
+            raise ValueError(
+                f"max_tokens {max_tokens} is above {MAX_NON_STREAMING_TOKENS}, the most the "
+                "Anthropic SDK allows without streaming"
+            )
         self._model = model
         self._max_tokens = max_tokens
         self._client = client or anthropic.Anthropic(max_retries=max_retries)
@@ -87,7 +94,10 @@ def _is_tool_results(api_message: dict[str, Any]) -> bool:
 
 
 def from_api_response(response: Any) -> ModelReply:
-    """Messages API response -> ModelReply. Text blocks are joined; tool_use blocks become calls."""
+    """Messages API response -> ModelReply. Text blocks are joined; tool_use blocks become calls.
+
+    stop_reason "max_tokens" means generation hit the output cap.
+    """
     texts = [block.text for block in response.content if block.type == "text"]
     calls = tuple(
         ToolCall(id=block.id, name=block.name, arguments=dict(block.input))
@@ -95,4 +105,9 @@ def from_api_response(response: Any) -> ModelReply:
         if block.type == "tool_use"
     )
     usage = Usage(response.usage.input_tokens, response.usage.output_tokens)
-    return ModelReply(text="\n".join(texts), tool_calls=calls, usage=usage)
+    return ModelReply(
+        text="\n".join(texts),
+        tool_calls=calls,
+        usage=usage,
+        truncated=response.stop_reason == "max_tokens",
+    )

@@ -5,6 +5,7 @@ One turn = the user's message, then model steps until the model replies without 
     record user_message
     repeat (at most max_steps):
         reply = model(system, messages, tools)       record assistant_message
+        cut off at the output token cap?  -> raise ReplyTruncated, record nothing
         no tool calls?  -> the turn is over, return the reply text
         for each call:  record tool_started -> run -> record tool_finished
 
@@ -32,6 +33,10 @@ DEFAULT_SYSTEM_PROMPT = (
 
 class MaxStepsReached(RuntimeError):
     """The model kept calling tools for max_steps steps without giving a final answer."""
+
+
+class ReplyTruncated(RuntimeError):
+    """The model hit its output token cap, so its reply may be incomplete. It was not recorded."""
 
 
 class OpenToolCalls(RuntimeError):
@@ -82,8 +87,16 @@ class Session:
         raise MaxStepsReached(f"no final answer after {self.max_steps} steps")
 
     def _step(self) -> ModelReply:
-        """One model call, then every tool call it asked for, in order."""
+        """One model call, then every tool call it asked for, in order.
+
+        A truncated reply is rejected before anything is recorded: its last tool call may have
+        incomplete arguments, and its text may be cut mid-sentence.
+        """
         reply = self.model.complete(self.system_prompt, self.state.messages, self.tools.specs())
+        if reply.truncated:
+            raise ReplyTruncated(
+                f"reply stopped at the output token cap after {reply.usage.output_tokens} tokens"
+            )
         self._record(
             "assistant_message",
             {

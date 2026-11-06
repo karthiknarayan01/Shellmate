@@ -20,7 +20,7 @@ from typing import Any
 import openai
 
 from runtime.messages import Message, ToolCall
-from runtime.model import ModelReply, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelReply, ToolSpec, Usage
 
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -30,7 +30,7 @@ class DeepSeekModel:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
-        max_tokens: int = 4096,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         max_retries: int = 3,
         client: openai.OpenAI | None = None,
     ):
@@ -105,8 +105,9 @@ def _assistant_message(m: Message) -> dict[str, Any]:
 
 
 def from_api_response(response: Any) -> ModelReply:
-    """Chat Completions response -> ModelReply."""
-    message = response.choices[0].message
+    """Chat Completions response -> ModelReply. finish_reason "length" means it hit the output cap."""
+    choice = response.choices[0]
+    message = choice.message
     calls = tuple(_parse_tool_call(c) for c in (message.tool_calls or []))
     usage = response.usage
     return ModelReply(
@@ -114,6 +115,7 @@ def from_api_response(response: Any) -> ModelReply:
         reasoning=getattr(message, "reasoning_content", None) or "",
         tool_calls=calls,
         usage=Usage(usage.prompt_tokens, usage.completion_tokens) if usage else Usage(),
+        truncated=choice.finish_reason == "length",
     )
 
 

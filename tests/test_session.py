@@ -5,7 +5,7 @@ import pytest
 from runtime.events import EventLog
 from runtime.messages import ToolCall
 from runtime.model import ModelReply
-from runtime.session import MaxStepsReached, OpenToolCalls, Session
+from runtime.session import MaxStepsReached, OpenToolCalls, ReplyTruncated, Session
 from runtime.state import project
 from runtime.tools import Tool, ToolRegistry
 from tests.fake_model import FakeModel, call, say
@@ -75,6 +75,18 @@ def test_step_limit_stops_a_model_that_never_finishes(log):
     with pytest.raises(MaxStepsReached):
         session.run_turn("go")
     assert session.state.open_calls == {}  # every call still got its result
+
+
+def test_truncated_reply_is_rejected_and_not_recorded(log):
+    cut_off = ModelReply(tool_calls=(ToolCall("c1", "echo", {}),), truncated=True)
+    ran = []
+    tool = Tool("echo", "", {"type": "object"}, lambda: ran.append(1) or "ok")
+    session = Session.create(log, FakeModel([cut_off]), ToolRegistry([tool]))
+
+    with pytest.raises(ReplyTruncated):
+        session.run_turn("go")
+    assert ran == []
+    assert [e.type for e in log.load(session.session_id)] == ["user_message"]
 
 
 def test_live_state_always_equals_a_replay_of_the_log(log):

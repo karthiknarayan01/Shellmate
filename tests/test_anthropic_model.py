@@ -8,7 +8,7 @@ import pytest
 
 from runtime.anthropic_model import AnthropicModel, from_api_response, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ToolSpec, Usage
 
 
 def test_user_and_assistant_messages():
@@ -48,11 +48,27 @@ def test_response_is_parsed_into_text_calls_and_usage():
             NS(type="tool_use", id="t1", name="read_file", input={"path": "a"}),
         ],
         usage=NS(input_tokens=120, output_tokens=30),
+        stop_reason="tool_use",
     )
     reply = from_api_response(response)
     assert reply.text == "Let me look."
     assert reply.tool_calls == (ToolCall("t1", "read_file", {"path": "a"}),)
     assert reply.usage == Usage(120, 30)
+    assert reply.truncated is False
+
+
+def test_hitting_the_output_cap_marks_the_reply_truncated():
+    response = NS(content=[NS(type="text", text="The answer is")],
+                  usage=NS(input_tokens=1, output_tokens=16_000), stop_reason="max_tokens")
+    assert from_api_response(response).truncated is True
+
+
+def test_default_output_cap_is_sent(monkeypatch):
+    sent = {}
+    client = NS(messages=NS(create=lambda **kw: sent.update(kw) or NS(
+        content=[], usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")))
+    AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
+    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS
 
 
 def test_request_carries_model_system_and_tools():
@@ -60,7 +76,8 @@ def test_request_carries_model_system_and_tools():
 
     def create(**kwargs):
         sent.update(kwargs)
-        return NS(content=[NS(type="text", text="ok")], usage=NS(input_tokens=1, output_tokens=1))
+        return NS(content=[NS(type="text", text="ok")],
+                  usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")
 
     client = NS(messages=NS(create=create))
     model = AnthropicModel(model="m", max_tokens=99, client=client)

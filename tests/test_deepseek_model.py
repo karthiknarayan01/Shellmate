@@ -8,7 +8,7 @@ import pytest
 
 from runtime.deepseek_model import BASE_URL, DeepSeekModel, from_api_response, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ToolSpec, Usage
 
 THINKING_CALL = Message(
     "assistant", "", reasoning="I should read it.",
@@ -49,6 +49,11 @@ def test_response_is_parsed_into_text_reasoning_calls_and_usage():
     assert reply.reasoning == "thinking..."
     assert reply.tool_calls == (ToolCall("t1", "read_file", {"path": "a"}),)
     assert reply.usage == Usage(100, 20)
+    assert reply.truncated is False
+
+
+def test_hitting_the_output_cap_marks_the_reply_truncated():
+    assert from_api_response(_response(content="The answer is", finish_reason="length")).truncated
 
 
 @pytest.mark.parametrize(
@@ -74,6 +79,7 @@ def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
         {"type": "function", "function": {"name": "t", "description": "does t", "parameters": {"type": "object"}}}
     ]
     assert sent[1]["model"] == "m"
+    assert sent[1]["max_tokens"] == DEFAULT_MAX_TOKENS
 
 
 def test_default_client_targets_deepseek(monkeypatch):
@@ -110,9 +116,12 @@ def test_smoke_full_tool_round_trip():
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
 
 
-def _response(content=None, tool_calls=None, **extra):
+def _response(content=None, tool_calls=None, finish_reason="stop", **extra):
     message = NS(content=content, tool_calls=tool_calls, **extra)
-    return NS(choices=[NS(message=message)], usage=NS(prompt_tokens=100, completion_tokens=20))
+    return NS(
+        choices=[NS(message=message, finish_reason=finish_reason)],
+        usage=NS(prompt_tokens=100, completion_tokens=20),
+    )
 
 
 def _api_call(call_id, name, arguments):

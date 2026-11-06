@@ -11,6 +11,11 @@ from typing import Any, Protocol
 
 from runtime.messages import Message, ToolCall
 
+# Default output cap per model request; the model stops generating at this many tokens.
+# Only tokens actually generated are billed, so the cap bounds the worst case per request.
+# Override with AGENT_MAX_OUTPUT_TOKENS (see providers.py).
+DEFAULT_MAX_TOKENS = 16_000
+
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
@@ -29,10 +34,14 @@ class Usage:
 
 @dataclass(frozen=True, slots=True)
 class ModelReply:
+    """One model response. `truncated` is True when generation stopped at the output cap,
+    so the text or a tool call's arguments may be incomplete."""
+
     text: str = ""
     reasoning: str = ""
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     usage: Usage = field(default_factory=Usage)
+    truncated: bool = False
 
 
 class ModelClient(Protocol):
