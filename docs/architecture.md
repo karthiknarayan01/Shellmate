@@ -72,7 +72,7 @@ The rest of this document follows from that split.
 | `runtime/providers.py` | `make_model()`: pick a provider by name |
 | `runtime/tools.py` | `Tool`, `ToolRegistry`: validate and run tool calls |
 | `runtime/workspace_tools.py` | `list_files`, `read_file`, `write_file` |
-| `runtime/web_tools.py` | `web_search`, `read_web_page` (Tavily) |
+| `runtime/web_tools.py` | `web_search`, `read_web_page` (free, via `ddgs`) |
 | `runtime/prompts.py` | the CLI's system prompt, with today's date |
 | `runtime/approval.py` | `Decision`, the `Approver` interface, `AutoApprove`, `DenyAll` |
 | `runtime/cli.py` | the terminal chat and its approval prompt |
@@ -402,14 +402,14 @@ Neither raises. The model sees the error and can correct itself, and the turn go
 
 The workspace tools resolve every path against the workspace root, following symlinks, and refuse anything that lands outside it. Output is capped at 20,000 characters. All three are idempotent; only `write_file` requires approval.
 
-The web tools use [Tavily](https://tavily.com), a search API built for agents, through its async client:
+The web tools are free and need no key or account. They use [`ddgs`](https://pypi.org/project/ddgs/) (formerly `duckduckgo-search`), a metasearch library: it sends the query to public search engines (DuckDuckGo, Bing, Brave and others) the way a browser does, and parses their result pages.
 
-| tool | Tavily call | notes |
+| tool | ddgs call | notes |
 |---|---|---|
-| `web_search(query, topic?, time_range?, max_results?)` | `search`, `search_depth="basic"` (1 credit) | `topic: "news"` searches news articles and adds publication dates; `time_range` (`day` … `year`) keeps only recent results. Results come back numbered with title, URL, date and the relevant text (clipped to 1,200 characters each), so the model can cite them |
+| `web_search(query, topic?, time_range?, max_results?)` | `text`, or `news` for `topic: "news"` | `time_range` (`day` … `year`) keeps only recent results. Results come back numbered with title, URL, date and source (news) and a snippet clipped to 1,200 characters, so the model can cite them |
 | `read_web_page(url)` | `extract`, markdown | for when a snippet isn't enough; http(s) only; clipped to 20,000 characters |
 
-Both only read, so they are idempotent and need no approval. Without `TAVILY_API_KEY` the client runs in Tavily's keyless mode, which allows these two calls with a small free quota; quota errors come back to the model as a result saying what to do. Queries and URLs are sent to Tavily. `--no-web` leaves both tools out.
+Both only read, so they are idempotent and need no approval. `ddgs` is synchronous, so the tool functions run in worker threads like any plain-function tool. It is unofficial: the engines can rate-limit it, and a change to their pages can break it until the library is updated. Rate limits, timeouts and failures come back to the model as results saying what happened. Queries and URLs are sent to those search engines. `--no-web` leaves both tools out.
 
 A model doesn't know today's date, and can't judge "latest" or a result's age without it, so the CLI's system prompt (`prompts.py`) states the date, built fresh on every start, and tells the model to search before answering about anything current and to cite its sources.
 

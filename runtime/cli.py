@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import signal
 import sys
 import threading
@@ -58,7 +57,6 @@ from runtime.session import (
 )
 from runtime.subscriptions import EventStream
 from runtime.tools import ToolRegistry
-from runtime.web_tools import API_KEY_ENV as WEB_API_KEY_ENV
 from runtime.web_tools import web_tools
 from runtime.workspace_tools import workspace_tools
 
@@ -125,8 +123,6 @@ def open_session(log: EventLog, args: argparse.Namespace, terminal: Terminal, ou
         if session_id is None or not log.has_session(session_id):
             raise SystemExit(f"no session to resume: {args.resume}")
         session = Session.open(log, session_id, model, tools, **options)
-    if web and not os.environ.get(WEB_API_KEY_ENV):
-        print(f"web search uses Tavily's free keyless quota; set {WEB_API_KEY_ENV} for more", file=out)
     return session
 
 

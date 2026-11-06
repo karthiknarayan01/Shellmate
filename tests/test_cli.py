@@ -132,14 +132,6 @@ def test_no_web_flag_removes_the_web_tools(tmp_path, monkeypatch):
     assert "web_search" not in request.system
 
 
-def test_keyless_web_search_is_mentioned_only_without_a_key(tmp_path, monkeypatch):
-    _use_model(monkeypatch, FakeModel([]))
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    assert "keyless quota" in _run(tmp_path, [], [])
-    monkeypatch.setenv("TAVILY_API_KEY", "k")
-    assert "keyless quota" not in _run(tmp_path, ["--resume", "latest"], [])
-
-
 def test_yes_flag_approves_without_asking(tmp_path, monkeypatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
