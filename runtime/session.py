@@ -34,6 +34,8 @@ Everything runs on one asyncio event loop in one thread. Model requests and tool
 awaited, so while they wait on the network or a worker thread, other tool calls make progress.
 Events are only ever written from the loop, so the log still has a single writer. Each one is
 then published to subscribers (subscribe()), which is how a UI follows a turn while it runs.
+While the model is generating a reply, the pieces of its text are published too, as
+StreamDelta items; they are never written to the log, which records the complete reply.
 """
 
 from __future__ import annotations
@@ -143,7 +145,8 @@ class Session:
         return cls(log, session_id, project(log.load(session_id)), model, tools, **options)
 
     def subscribe(self) -> EventStream:
-        """Follow the session live: a stream of every event recorded from now on.
+        """Follow the session live: every event recorded from now on, and the StreamDelta pieces
+        of each model reply while it is being generated.
 
         Use as `async with session.subscribe() as events: async for event in events: ...`
         """
@@ -197,7 +200,9 @@ class Session:
         and its text may be cut mid-sentence. The turn is stopped instead.
         """
         await self._compact_if_needed()
-        reply = await self.model.complete(self.system_prompt, self.state.messages, self.tools.specs())
+        reply = await self.model.complete(
+            self.system_prompt, self.state.messages, self.tools.specs(), on_delta=self._hub.publish
+        )
         if reply.truncated:
             self._record("turn_stopped", {"reason": "truncated"})
             raise ReplyTruncated(

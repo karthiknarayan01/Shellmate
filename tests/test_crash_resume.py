@@ -104,10 +104,10 @@ async def _child_dies_in_approver(db, sid, effects):
 
 async def _child_dies_in_second_model_call(db, sid, effects):
     class DieOnSecondCall(FakeModel):
-        async def complete(self, system, messages, tools):
+        async def complete(self, system, messages, tools, on_delta=None):
             if self.requests:
                 _die()
-            return await super().complete(system, messages, tools)
+            return await super().complete(system, messages, tools, on_delta)
 
     with EventLog(db) as log:
         session = Session.open(log, sid, DieOnSecondCall([call("append_line", text="hello")]),

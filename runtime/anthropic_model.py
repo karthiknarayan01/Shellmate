@@ -1,24 +1,30 @@
-"""ModelClient for Anthropic's Messages API.
+"""ModelClient for Anthropic's Messages API, streamed.
 
 Converts the runtime's Message list to the API's format and the API's response back to a
 ModelReply. Retries on rate limits, overload, 5xx and connection errors are done by the SDK
-(exponential backoff with jitter, `max_retries` attempts).
+(exponential backoff with jitter, `max_retries` attempts) while the stream is being opened; a
+stream that breaks after it started is not retried and raises ModelError.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 import os
+from typing import Any
 
 import anthropic
 
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ModelReply, ToolSpec, Usage
+from runtime.model import (
+    DEFAULT_MAX_TOKENS,
+    DeltaSink,
+    ModelError,
+    ModelReply,
+    StreamDelta,
+    ToolSpec,
+    Usage,
+)
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
-# Above this, the SDK refuses non-streaming requests (they could run past 10 minutes).
-MAX_NON_STREAMING_TOKENS = 21_333
 
 
 class AnthropicModel:
@@ -30,11 +36,6 @@ class AnthropicModel:
         client: anthropic.AsyncAnthropic | None = None,
     ):
         """`client` defaults to one reading ANTHROPIC_API_KEY from the environment."""
-        if max_tokens > MAX_NON_STREAMING_TOKENS:
-            raise ValueError(
-                f"max_tokens {max_tokens} is above {MAX_NON_STREAMING_TOKENS}, the most the "
-                "Anthropic SDK allows without streaming"
-            )
         self._model = model
         self._max_tokens = max_tokens
         if client is None and not os.environ.get("ANTHROPIC_API_KEY"):
@@ -42,11 +43,20 @@ class AnthropicModel:
         self._client = client or anthropic.AsyncAnthropic(max_retries=max_retries)
 
     async def complete(
-        self, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        on_delta: DeltaSink | None = None,
     ) -> ModelReply:
-        """Send one request and return the parsed reply. API failures raise ModelError."""
+        """Stream one reply, passing text to `on_delta` as it arrives; return the whole reply.
+
+        The SDK assembles the streamed events into the final message, which is parsed exactly
+        like a non-streamed response. API failures, including a stream that breaks halfway,
+        raise ModelError.
+        """
         try:
-            response = await self._client.messages.create(
+            async with self._client.messages.stream(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=system,
@@ -55,7 +65,11 @@ class AnthropicModel:
                     {"name": t.name, "description": t.description, "input_schema": t.input_schema}
                     for t in tools
                 ],
-            )
+            ) as stream:
+                async for text in stream.text_stream:
+                    if on_delta is not None:
+                        on_delta(StreamDelta("text", text))
+                response = await stream.get_final_message()
         except anthropic.APIError as e:
             raise ModelError(f"Anthropic API error: {e}") from e
         return from_api_response(response)

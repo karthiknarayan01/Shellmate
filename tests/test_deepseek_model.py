@@ -1,5 +1,5 @@
-"""DeepSeekModel: message conversion both ways, reasoning pass-back, malformed tool arguments.
-No network, except the smoke test, which runs only when DEEPSEEK_API_KEY is set."""
+"""DeepSeekModel: message conversion, assembling a streamed reply, reasoning pass-back, malformed
+tool arguments. No network, except the smoke test, which runs only when DEEPSEEK_API_KEY is set."""
 
 import os
 from types import SimpleNamespace as NS
@@ -7,9 +7,9 @@ from types import SimpleNamespace as NS
 import openai
 import pytest
 
-from runtime.deepseek_model import BASE_URL, DeepSeekModel, from_api_response, to_api_messages
+from runtime.deepseek_model import BASE_URL, DeepSeekModel, StreamAssembler, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, StreamDelta, ToolSpec, Usage
 
 THINKING_CALL = Message(
     "assistant", "", reasoning="I should read it.",
@@ -40,21 +40,43 @@ def test_error_results_are_prefixed():
     assert api[1]["content"] == "ERROR: no such file"
 
 
-def test_response_is_parsed_into_text_reasoning_calls_and_usage():
-    reply = from_api_response(_response(
-        content="Let me look.",
-        reasoning_content="thinking...",
-        tool_calls=[_api_call("t1", "read_file", '{"path": "a"}')],
-    ))
+def test_streamed_chunks_assemble_into_one_reply():
+    reply = _assemble(
+        _chunk(reasoning_content="I should "),
+        _chunk(reasoning_content="look."),
+        _chunk(content="Let me "),
+        _chunk(content="look."),
+        _chunk(tool_calls=[_piece(0, id="t1", name="read_file", arguments='{"pa')]),
+        _chunk(tool_calls=[_piece(0, arguments='th": "a"}')]),
+        _chunk(finish_reason="tool_calls"),
+        _usage_chunk(100, 20),
+    )
+    assert reply.reasoning == "I should look."
     assert reply.text == "Let me look."
-    assert reply.reasoning == "thinking..."
     assert reply.tool_calls == (ToolCall("t1", "read_file", {"path": "a"}),)
     assert reply.usage == Usage(100, 20)
     assert reply.truncated is False
 
 
+def test_parallel_tool_calls_are_kept_apart_and_in_index_order():
+    reply = _assemble(
+        _chunk(tool_calls=[_piece(1, id="t2", name="b", arguments="{}")]),
+        _chunk(tool_calls=[_piece(0, id="t1", name="a", arguments="{}")]),
+    )
+    assert [c.id for c in reply.tool_calls] == ["t1", "t2"]
+
+
+def test_text_and_reasoning_are_reported_as_they_arrive():
+    deltas = []
+    assembler = StreamAssembler(deltas.append)
+    assembler.add(_chunk(reasoning_content="hmm"))
+    assembler.add(_chunk(content="Hel"))
+    assembler.add(_chunk(content="lo"))
+    assert deltas == [StreamDelta("reasoning", "hmm"), StreamDelta("text", "Hel"), StreamDelta("text", "lo")]
+
+
 def test_hitting_the_output_cap_marks_the_reply_truncated():
-    assert from_api_response(_response(content="The answer is", finish_reason="length")).truncated
+    assert _assemble(_chunk(content="The answer is"), _chunk(finish_reason="length")).truncated
 
 
 @pytest.mark.parametrize(
@@ -63,24 +85,43 @@ def test_hitting_the_output_cap_marks_the_reply_truncated():
     ids=["truncated", "not-an-object"],
 )
 def test_bad_tool_arguments_become_arguments_error(raw, error):
-    (call,) = from_api_response(_response(tool_calls=[_api_call("t1", "read_file", raw)])).tool_calls
+    (call,) = _assemble(_chunk(tool_calls=[_piece(0, id="t1", name="read_file", arguments=raw)])).tool_calls
     assert call.arguments == {} and error in call.arguments_error
 
 
-async def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
+async def test_request_streams_and_omits_tools_when_there_are_none():
     sent = []
-    client = NS(chat=NS(completions=NS(create=_async(lambda **kw: sent.append(kw) or _response(content="ok")))))
-    model = DeepSeekModel(model="m", client=client)
 
-    await model.complete("s", [Message("user", "hi")], [])
+    async def create(**kwargs):
+        sent.append(kwargs)
+        return _stream(_chunk(content="ok"), _usage_chunk(1, 1))
+
+    model = DeepSeekModel(model="m", client=NS(chat=NS(completions=NS(create=create))))
+    deltas = []
+    reply = await model.complete("s", [Message("user", "hi")], [], on_delta=deltas.append)
     await model.complete("s", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
 
+    assert reply.text == "ok" and deltas == [StreamDelta("text", "ok")]
+    assert sent[0]["stream"] is True and sent[0]["stream_options"] == {"include_usage": True}
     assert "tools" not in sent[0]
     assert sent[1]["tools"] == [
         {"type": "function", "function": {"name": "t", "description": "does t", "parameters": {"type": "object"}}}
     ]
     assert sent[1]["model"] == "m"
     assert sent[1]["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+async def test_a_stream_that_breaks_halfway_is_a_model_error():
+    async def broken():
+        yield _chunk(content="Hel")
+        raise openai.APIConnectionError(request=None)
+
+    async def create(**kwargs):
+        return broken()
+
+    model = DeepSeekModel(client=NS(chat=NS(completions=NS(create=create))))
+    with pytest.raises(ModelError, match="DeepSeek API error"):
+        await model.complete("s", [Message("user", "hi")], [])
 
 
 async def test_api_failures_become_model_errors():
@@ -126,20 +167,26 @@ async def test_smoke_full_tool_round_trip():
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
 
 
-def _response(content=None, tool_calls=None, finish_reason="stop", **extra):
-    message = NS(content=content, tool_calls=tool_calls, **extra)
-    return NS(
-        choices=[NS(message=message, finish_reason=finish_reason)],
-        usage=NS(prompt_tokens=100, completion_tokens=20),
-    )
+def _assemble(*chunks):
+    assembler = StreamAssembler()
+    for chunk in chunks:
+        assembler.add(chunk)
+    return assembler.reply()
 
 
-def _api_call(call_id, name, arguments):
-    return NS(id=call_id, function=NS(name=name, arguments=arguments))
+def _chunk(content=None, tool_calls=None, finish_reason=None, **extra):
+    delta = NS(content=content, tool_calls=tool_calls, **extra)
+    return NS(choices=[NS(delta=delta, finish_reason=finish_reason)], usage=None)
 
 
-def _async(fn):
-    """Wrap a plain function as the coroutine function the async SDK clients expose."""
-    async def wrapper(**kwargs):
-        return fn(**kwargs)
-    return wrapper
+def _usage_chunk(prompt_tokens, completion_tokens):
+    return NS(choices=[], usage=NS(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens))
+
+
+def _piece(index, id=None, name=None, arguments=None):
+    return NS(index=index, id=id, function=NS(name=name, arguments=arguments))
+
+
+async def _stream(*chunks):
+    for chunk in chunks:
+        yield chunk

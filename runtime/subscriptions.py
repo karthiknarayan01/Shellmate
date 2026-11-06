@@ -1,8 +1,13 @@
 """In-memory publish/subscribe for a session's events, so a UI can follow a turn as it runs.
 
     session ──_record()──► EventHub.publish(event) ──► EventStream (one queue per subscriber)
-                                                           │
-                       UI task:  async for event in stream: show it
+    model stream ─────────► EventHub.publish(delta)         │
+                       UI task:  async for item in stream: show it
+
+Two kinds of item are published, in the order they happen:
+    Event        a recorded event (it is already in the log)
+    StreamDelta  a piece of a model reply while it is being generated (never in the log; the
+                 complete reply follows as an assistant_message Event)
 
 Publishing never waits: each subscriber has its own unbounded queue, so a slow UI can't slow
 the agent down, and the agent never sees who is listening. Every event is published after it
@@ -17,6 +22,9 @@ from __future__ import annotations
 import asyncio
 
 from runtime.events import Event
+from runtime.model import StreamDelta
+
+Item = Event | StreamDelta
 
 _END = object()
 
@@ -31,9 +39,9 @@ class EventHub:
         self._streams.append(stream)
         return stream
 
-    def publish(self, event: Event) -> None:
+    def publish(self, item: Item) -> None:
         for stream in list(self._streams):
-            stream._put(event)
+            stream._put(item)
 
     def _remove(self, stream: EventStream) -> None:
         if stream in self._streams:
@@ -41,7 +49,7 @@ class EventHub:
 
 
 class EventStream:
-    """One subscriber's events, in order. Iterate with `async for`; close() ends the iteration.
+    """One subscriber's items, in order. Iterate with `async for`; close() ends the iteration.
 
     Use as `async with session.subscribe() as events:` so it is closed (and stops receiving)
     when the block ends.
@@ -62,8 +70,8 @@ class EventStream:
     def __aiter__(self) -> EventStream:
         return self
 
-    async def __anext__(self) -> Event:
-        """The next event. Asking for it also marks the previous one as handled."""
+    async def __anext__(self) -> Item:
+        """The next item. Asking for it also marks the previous one as handled."""
         self._mark_handled()
         item = await self._queue.get()
         if item is _END:
@@ -84,9 +92,9 @@ class EventStream:
         self._hub._remove(self)
         self._queue.put_nowait(_END)
 
-    def _put(self, event: Event) -> None:
+    def _put(self, item: Item) -> None:
         if not self._closed:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait(item)
 
     def _mark_handled(self) -> None:
         if self._handling:

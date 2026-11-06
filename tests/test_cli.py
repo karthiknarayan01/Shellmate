@@ -98,6 +98,22 @@ def test_progress_lines_come_before_the_approval_prompt(tmp_path, monkeypatch):
     assert narration < prompt < started < answer
 
 
+def test_streamed_answer_is_printed_once(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([say("one two three four five six seven")]))
+    out = _run(tmp_path, [], ["count"])
+    assert out.count("one two three four five six seven") == 1
+    assert "assistant> one two three four five six seven\n" in out
+
+
+def test_thinking_is_shown_once_while_the_model_reasons(tmp_path, monkeypatch):
+    reply = ModelReply(text="42", reasoning="let me think about this carefully for a moment")
+    _use_model(monkeypatch, FakeModel([reply]))
+    out = _run(tmp_path, [], ["what is the answer?"])
+    assert out.count("(thinking...)") == 1
+    assert out.index("(thinking...)") < out.index("assistant> 42")
+    assert "carefully" not in out  # the reasoning itself isn't printed
+
+
 def test_yes_flag_approves_without_asking(tmp_path, monkeypatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -214,11 +230,11 @@ class FlakyModel(FakeModel):
         super().__init__(replies=replies)
         self.fail_times = fail_times
 
-    async def complete(self, system, messages, tools):
+    async def complete(self, system, messages, tools, on_delta=None):
         if self.fail_times:
             self.fail_times -= 1
             raise ModelError("Anthropic API error: overloaded")
-        return await super().complete(system, messages, tools)
+        return await super().complete(system, messages, tools, on_delta)
 
 
 def _use_model(monkeypatch, model):

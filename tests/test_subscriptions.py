@@ -5,8 +5,9 @@ import asyncio
 import pytest
 
 from runtime.events import Event, EventLog
+from runtime.compaction import CompactionPolicy
 from runtime.messages import ToolCall
-from runtime.model import ModelReply
+from runtime.model import ModelReply, StreamDelta
 from runtime.session import Session
 from runtime.subscriptions import EventHub
 from runtime.tools import Tool, ToolRegistry
@@ -81,6 +82,8 @@ async def test_a_subscriber_follows_a_turn_while_it_runs(log):
         turn = asyncio.create_task(session.run_turn("go"))
         seen = []
         async for event in events:
+            if isinstance(event, StreamDelta):
+                continue
             seen.append(event.type)
             if event.type == "tool_started":
                 assert not turn.done()  # the turn is still waiting on the tool
@@ -106,12 +109,52 @@ async def test_state_is_up_to_date_when_an_event_arrives(log):
     async with session.subscribe() as events:
         turn = asyncio.create_task(session.run_turn("go"))
         async for event in events:
+            if isinstance(event, StreamDelta):
+                continue
             assert session.state.last_seq >= event.seq
             if event.type == "tool_started":
                 assert "c1" in session.state.tool_calls
             if event.type == "assistant_message" and not event.payload["tool_calls"]:
                 break
         await turn
+
+
+async def test_reply_text_is_streamed_before_its_event_and_never_logged(log):
+    reply = ModelReply(text="Let me check that for you", reasoning="the user wants a check")
+    session = Session.create(log, FakeModel([reply]), ToolRegistry([]))
+
+    items = []
+    async with session.subscribe() as events:
+        turn = asyncio.create_task(session.run_turn("go"))
+        async for item in events:
+            items.append(item)
+            if isinstance(item, Event) and item.type == "assistant_message":
+                break
+        await turn
+
+    deltas = [i for i in items if isinstance(i, StreamDelta)]
+    assert "".join(d.text for d in deltas if d.kind == "text") == "Let me check that for you"
+    assert "".join(d.text for d in deltas if d.kind == "reasoning") == "the user wants a check"
+    assert items.index(deltas[-1]) < items.index(items[-1])  # all deltas before the event
+    assert [e.type for e in log.load(session.session_id)] == ["user_message", "assistant_message"]
+
+
+async def test_the_compaction_summary_is_not_streamed(log):
+    model = FakeModel([say("x" * 16_000), say("SECRET SUMMARY"), say("second")])
+    session = Session.create(log, model, ToolRegistry([]), compaction=CompactionPolicy(context_window=4_000))
+    await session.run_turn("first")
+
+    texts = []
+    async with session.subscribe() as events:
+        turn = asyncio.create_task(session.run_turn("again"))
+        async for item in events:
+            if isinstance(item, StreamDelta):
+                texts.append(item.text)
+            elif item.type == "assistant_message":
+                break
+        await turn
+    assert "SECRET" not in "".join(texts)
+    assert "".join(texts) == "second"
 
 
 def _event(seq):

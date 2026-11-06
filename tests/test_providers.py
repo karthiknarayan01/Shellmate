@@ -45,13 +45,6 @@ def test_bad_env_value_is_rejected(monkeypatch, raw, error):
         make_model("deepseek")
 
 
-def test_anthropic_cap_above_the_non_streaming_limit_is_rejected(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    monkeypatch.setenv("AGENT_MAX_OUTPUT_TOKENS", "32000")
-    with pytest.raises(ValueError, match="without streaming"):
-        make_model("anthropic")
-
-
 def test_unknown_provider():
     with pytest.raises(ValueError, match="unknown provider"):
         make_model("nope")

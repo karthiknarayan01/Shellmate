@@ -2,12 +2,17 @@
 
 A model client takes the system prompt, the conversation and the tool specs, and returns one
 reply: text, tool calls, or both. Implemented by anthropic_model.py and deepseek_model.py.
+
+Replies are streamed from the provider. While a reply is being generated, the client calls
+`on_delta` with each piece of text (and of reasoning, for models that return it) as it arrives;
+the complete reply is still returned at the end. Deltas are for display only: the runtime
+records the complete reply, never the pieces.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from runtime.messages import Message, ToolCall
 
@@ -44,11 +49,26 @@ class ModelReply:
     truncated: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class StreamDelta:
+    """A piece of a reply while it is being generated. `kind` is "text" or "reasoning"."""
+
+    kind: Literal["text", "reasoning"]
+    text: str
+
+
+DeltaSink = Callable[[StreamDelta], None]
+
+
 class ModelError(RuntimeError):
     """The provider's API failed after the client's retries (auth, quota, outage, bad request)."""
 
 
 class ModelClient(Protocol):
     async def complete(
-        self, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        on_delta: DeltaSink | None = None,
     ) -> ModelReply: ...
