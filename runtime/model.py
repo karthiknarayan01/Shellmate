@@ -1,9 +1,7 @@
 """What the agent loop needs from a language model, independent of provider.
 
 A model client takes the system prompt, the conversation and the tool specs, and returns one
-reply: text, tool calls, or both. Provider adapters implement this:
-anthropic_model.py (Anthropic Messages API) and openai_compatible_model.py (DeepSeek, OpenAI,
-and self-hosted open-source models served by vLLM, SGLang or Ollama).
+reply: text, tool calls, or both. Implemented by anthropic_model.py and deepseek_model.py.
 """
 
 from __future__ import annotations
