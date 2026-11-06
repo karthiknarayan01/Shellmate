@@ -417,9 +417,41 @@ To give an agent other tools, build a `ToolRegistry` from your own `Tool`s and p
 
 ## 11. The command-line chat
 
-`cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, run the turn. Each turn runs as one task while a display task follows `session.subscribe()` and prints what's worth showing: the model's text as it is generated (including what it says before calling tools; when its `assistant_message` arrives the line is just ended, not printed again), "(thinking...)" once while a model reasons before answering, and, from `describe(event)`, each tool call as it starts, tool errors, skipped calls and compactions. The final answer is just the last of those lines; then control returns to the prompt. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
+The CLI is four files:
 
-Two details come from running on an event loop. Terminal input is read by one background thread, one line per prompt, and handed to the loop through a queue: a prompt abandoned with Ctrl+C leaves its read outstanding, and that read answers the next prompt instead of a second reader swallowing a line. Ctrl+C is installed as a signal handler that cancels whatever task is running (the turn, or the wait at a prompt), so it never stops the loop itself; a cancelled turn is then ended with `Session.cancel()`.
+| file | job |
+|---|---|
+| `cli.py` | arguments, the welcome panel, the prompt loop and slash commands, running a turn, the cost line after it |
+| `terminal_input.py` | `Terminal`: reading lines, and turning Ctrl+C into cancelling the current task |
+| `terminal_display.py` | `TurnDisplay`: drawing a turn from the session's event stream |
+| `terminal_approval.py` | `TerminalApprover`: the approval panel, with a diff for `write_file` |
+
+`cli.py: main` migrates the database, shows the welcome panel (model, workspace, session, web search, approval mode), finishes an interrupted turn if there is one, then loops: read a message, run the turn. Messages starting with `/` are commands (`/help`, `/new`, `/status`, `/resume`, `/clear`, `/exit`).
+
+**Drawing a turn.** Each turn runs as one task while `TurnDisplay.follow` reads `session.subscribe()` in another, using [rich](https://github.com/Textualize/rich):
+
+```
+Fig. 8  What a turn looks like
+
+  ⠋ Thinking… 2s                           spinner while the turn waits on the model
+  Let me look at the config.               the model's text, rendered as markdown as it streams
+  ● read_file  path=config.py              each tool call as it starts
+  ● list_files
+    ⎿  read_file: 2 lines  0.1s             each result, summarized in one line; when calls run
+    ⎿  list_files: 1 file                   in parallel, each result names its call
+  ╭─ Allow write_file? ─────────╮          the approval panel, with a diff of the change
+  │ -DEBGU = True               │
+  │ +DEBUG = True               │
+  ╰─────────────────────────────╯
+  Fixed the typo.                          the answer
+    claude-sonnet-5-5 · 3.4k in / 220 out · context 3% · 6.1s
+```
+
+There is always at most one live region on screen: the spinner, or the answer being streamed. Anything else that needs printing (a tool line, the approval panel) stops it first. When an approval is requested, the display stops the spinner, and the approval panel waits until the display has handled every event so far (`EventStream.drained()`), so the panel always comes after the lines that led to it and nothing redraws over the prompt. When the output isn't a terminal (a pipe, a file, the tests), rich draws nothing transient, so the same turn comes out as plain lines without the spinner.
+
+**Reading input.** On a real terminal, `Terminal.interactive` uses [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit) on the same event loop. It gives line editing, history kept across runs (`~/.local/state/agent-runtime/history`), suggestions from history as you type, Tab-completion of `/` commands, Alt+Enter for a new line, and a bottom toolbar showing the model, session and context use. Otherwise a single background thread reads one line per prompt and hands it to the loop: a prompt abandoned with Ctrl+C leaves its read outstanding, and that read answers the next prompt instead of a second reader swallowing a line.
+
+**Ctrl+C.** During a turn it is a signal handler that cancels the turn's task, so it never stops the event loop; the cancelled turn is then ended with `Session.cancel()`. At a prompt it ends the chat.
 
 ## 12. Tests
 
@@ -434,6 +466,7 @@ The tests that check the central guarantees:
 | a denied tool never runs | `test_session_approvals.py` |
 | calls from one reply run at the same time, approvals first, at most `max_parallel_tools` | `test_session_parallel_tools.py` |
 | a subscriber sees each event while the turn is still running; one that never reads doesn't block it | `test_subscriptions.py` |
+| a turn is drawn in order; the spinner never redraws over an approval prompt; terminal input survives Ctrl+C | `test_terminal_display.py`, `test_terminal_input.py`, `test_cli.py` |
 | a reply's text is streamed before its event and never logged; streamed chunks rebuild the same reply | `test_subscriptions.py`, `test_deepseek_model.py`, `test_anthropic_model.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |

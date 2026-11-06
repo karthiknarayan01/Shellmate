@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import os
 
+from runtime.anthropic_model import DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL
 from runtime.anthropic_model import AnthropicModel
+from runtime.deepseek_model import DEFAULT_MODEL as DEEPSEEK_DEFAULT_MODEL
 from runtime.deepseek_model import DeepSeekModel
 from runtime.model import DEFAULT_MAX_TOKENS, ModelClient
 
 PROVIDERS = {"anthropic": AnthropicModel, "deepseek": DeepSeekModel}
+DEFAULT_MODELS = {"anthropic": ANTHROPIC_DEFAULT_MODEL, "deepseek": DEEPSEEK_DEFAULT_MODEL}
 MAX_TOKENS_ENV = "AGENT_MAX_OUTPUT_TOKENS"
 
 

@@ -47,14 +47,20 @@ agent-runtime --no-web                 don't give the agent web search
 agent-runtime --db sessions.db         keep sessions in another file (default agent.db)
 ```
 
-In the chat:
+In the chat, the agent's work is shown as it happens: a spinner while it waits, each tool call with a one-line result, and the answer rendered as markdown while it streams in. Tools that change something ask first, in a panel that shows a diff of the change. A dim line after each turn shows the tokens used, how full the context window is, and the time taken.
 
 | | |
 |---|---|
-| at an approval prompt | `y` approve · `a` approve this tool for the session · `n` deny and stop the turn · any other text: deny and send it to the model as feedback |
-| Ctrl+C during a turn | cancel that turn |
+| at an approval prompt | `y` approve · `a` always allow this tool for the session · `n` deny and stop the turn · any other text: deny and send it to the model as feedback |
+| `/help` | commands and keys |
+| `/new` | start a fresh session |
+| `/status` | session id, model, messages, context use, tools |
 | `/resume` | retry a turn that failed on a model API error |
+| `/clear` | clear the screen |
 | `/exit`, Ctrl+D | quit |
+| Ctrl+C | cancel the running turn (at the prompt: quit) |
+| Alt+Enter, or Esc then Enter | new line in a message |
+| ↑ / ↓, Tab | earlier messages (kept across runs) · complete a `/` command |
 
 ## Configuration
 
