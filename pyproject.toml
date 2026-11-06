@@ -7,7 +7,7 @@ name = "agent-runtime"
 version = "0.1.0"
 description = "A crash-safe agent runtime: append-only event log, resume without repeating tools, approvals, compaction"
 requires-python = ">=3.11"
-dependencies = ["anthropic>=0.40", "openai>=1.50", "jsonschema>=4"]
+dependencies = ["anthropic>=0.40", "openai>=1.50", "jsonschema>=4", "tavily-python>=0.7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
