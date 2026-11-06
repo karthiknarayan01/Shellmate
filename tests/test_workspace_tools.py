@@ -64,6 +64,10 @@ def test_only_write_file_requires_approval(tools):
     assert [n for n in ("list_files", "read_file", "write_file") if tools.requires_approval(n)] == ["write_file"]
 
 
+def test_all_workspace_tools_are_idempotent(tools):
+    assert all(tools.is_idempotent(n) for n in ("list_files", "read_file", "write_file"))
+
+
 def test_missing_file_is_an_error_result(tools):
     assert _run(tools, "read_file", path="nope.py").is_error
 

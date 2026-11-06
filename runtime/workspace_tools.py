@@ -2,7 +2,8 @@
 
 Every path is resolved and must stay inside the workspace root; `..`, an absolute path or a
 symlink pointing elsewhere is refused. write_file changes the workspace, so it requires
-approval.
+approval. All three are idempotent: repeating a call with the same arguments gives the same
+result, so each is safe to re-run after a crash.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ def workspace_tools(root: str | Path) -> list[Tool]:
                 "additionalProperties": False,
             },
             fn=lambda path=".": list_files(root, path),
+            idempotent=True,
         ),
         Tool(
             name="read_file",
@@ -43,6 +45,7 @@ def workspace_tools(root: str | Path) -> list[Tool]:
                 "additionalProperties": False,
             },
             fn=lambda path, start_line=1, end_line=None: read_file(root, path, start_line, end_line),
+            idempotent=True,
         ),
         Tool(
             name="write_file",
@@ -55,6 +58,7 @@ def workspace_tools(root: str | Path) -> list[Tool]:
             },
             fn=lambda path, content: write_file(root, path, content),
             requires_approval=True,
+            idempotent=True,  # writing the same full content twice leaves the same file
         ),
     ]
 
