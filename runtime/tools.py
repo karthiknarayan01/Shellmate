@@ -1,7 +1,10 @@
 """Tool registry: the tools a session may use, and running one tool call safely.
 
-A tool is a name, a description, a JSON schema for its arguments, a Python function, and
-whether it needs approval before it runs (any tool that changes something should).
+A tool is a name, a description, a JSON schema for its arguments, a Python function, and two
+flags:
+    requires_approval  ask before running it (any tool that changes something should)
+    idempotent         running it twice with the same arguments leaves the same result as once,
+                       so after a crash mid-run it is safe to run again
 
 Running a call has two parts, so the session can ask for approval in between:
     check(call)    is the call well-formed? (known tool, valid JSON, matches the schema)
@@ -28,6 +31,7 @@ class Tool:
     input_schema: dict[str, Any]
     fn: Callable[..., str]  # called with the validated arguments as keyword arguments
     requires_approval: bool = False
+    idempotent: bool = False
 
     def spec(self) -> ToolSpec:
         return ToolSpec(self.name, self.description, self.input_schema)
@@ -79,3 +83,7 @@ class ToolRegistry:
     def requires_approval(self, name: str) -> bool:
         tool = self._tools.get(name)
         return tool is not None and tool.requires_approval
+
+    def is_idempotent(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return tool is not None and tool.idempotent

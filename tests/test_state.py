@@ -138,9 +138,14 @@ def test_starting_twice_is_rejected():
         project(_tool_turn(("tool_started", {"call_id": "c1"}), ("tool_started", {"call_id": "c1"})))
 
 
-def test_conversation_cannot_move_on_with_open_calls():
-    with pytest.raises(InvalidEventSequence, match="have no result"):
+def test_a_new_turn_cannot_start_while_one_is_open():
+    with pytest.raises(InvalidEventSequence, match="turn is still open"):
         project(_tool_turn(("user_message", {"text": "never mind"})))
+
+
+def test_model_cannot_reply_while_calls_have_no_result():
+    with pytest.raises(InvalidEventSequence, match="have no result"):
+        project(_tool_turn(("assistant_message", {"text": "anyway", "tool_calls": []})))
 
 
 def test_duplicate_call_ids_are_rejected():
@@ -222,6 +227,55 @@ def test_out_of_order_approval_events_are_rejected(tail, error):
     with pytest.raises(InvalidEventSequence, match=error):
         project(_tool_turn(*tail))
 
+
+
+# ── turns and restarts ───────────────────────────────────────────────────────────────────
+
+
+def test_turn_is_open_until_a_reply_without_tool_calls():
+    call = {"id": "c1", "name": "t", "arguments": {}}
+    steps = [
+        ("user_message", {"text": "go"}),
+        ("assistant_message", {"text": "", "tool_calls": [call]}),
+        ("tool_started", {"call_id": "c1"}),
+        ("tool_finished", {"call_id": "c1", "output": "ok", "is_error": False}),
+        ("assistant_message", {"text": "done", "tool_calls": []}),
+    ]
+    open_after_each = [project(_events(*steps[:n])).turn_open for n in range(len(steps) + 1)]
+    assert open_after_each == [False, True, True, True, True, False]
+
+
+def test_turn_stopped_closes_the_turn():
+    state = project(_tool_turn(
+        ("tool_skipped", {"call_id": "c1", "reason": "skipped"}),
+        ("turn_stopped", {"reason": "denied"}),
+    ))
+    assert state.turn_open is False
+
+
+@pytest.mark.parametrize(
+    "events, error",
+    [
+        ([("turn_stopped", {"reason": "x"})], "no open turn"),
+        ([("user_message", {"text": "go"}),
+          ("assistant_message", {"text": "", "tool_calls": [{"id": "c1", "name": "t", "arguments": {}}]}),
+          ("turn_stopped", {"reason": "x"})], "have no result"),
+    ],
+    ids=["no-turn", "open-calls"],
+)
+def test_turn_stopped_needs_an_open_turn_with_no_open_calls(events, error):
+    with pytest.raises(InvalidEventSequence, match=error):
+        project(_events(*events))
+
+
+def test_restart_keeps_the_call_started():
+    state = project(_tool_turn(("tool_started", {"call_id": "c1"}), ("tool_restarted", {"call_id": "c1"})))
+    assert state.tool_calls["c1"].status is ToolCallStatus.STARTED
+
+
+def test_restart_of_a_call_that_never_started_is_rejected():
+    with pytest.raises(InvalidEventSequence, match="expected started"):
+        project(_tool_turn(("tool_restarted", {"call_id": "c1"})))
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
 

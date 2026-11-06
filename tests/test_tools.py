@@ -62,6 +62,13 @@ def test_only_tools_marked_as_such_require_approval():
     assert not registry.requires_approval("unknown")
 
 
+def test_only_tools_marked_as_such_are_idempotent():
+    registry = ToolRegistry([Tool("read", "", {}, str, idempotent=True), Tool("send", "", {}, str)])
+    assert registry.is_idempotent("read")
+    assert not registry.is_idempotent("send")
+    assert not registry.is_idempotent("unknown")
+
+
 def test_duplicate_names_are_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         ToolRegistry([Tool("x", "", {}, str), Tool("x", "", {}, str)])

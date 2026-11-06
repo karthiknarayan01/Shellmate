@@ -5,7 +5,7 @@ import pytest
 from runtime.events import EventLog
 from runtime.messages import ToolCall
 from runtime.model import ModelReply
-from runtime.session import MaxStepsReached, OpenToolCalls, ReplyTruncated, Session
+from runtime.session import MaxStepsReached, ReplyTruncated, Session, TurnInProgress
 from runtime.state import project
 from runtime.tools import Tool, ToolRegistry
 from tests.fake_model import FakeModel, call, say
@@ -86,7 +86,7 @@ def test_truncated_reply_is_rejected_and_not_recorded(log):
     with pytest.raises(ReplyTruncated):
         session.run_turn("go")
     assert ran == []
-    assert [e.type for e in log.load(session.session_id)] == ["user_message"]
+    assert [e.type for e in log.load(session.session_id)] == ["user_message", "turn_stopped"]
 
 
 def test_live_state_always_equals_a_replay_of_the_log(log):
@@ -107,14 +107,14 @@ def test_open_continues_a_session_from_the_log(log):
     assert [m.text for m in model.requests[0].messages] == ["first", "one", "second"]
 
 
-def test_a_session_left_with_open_tool_calls_refuses_a_new_turn(log):
+def test_an_interrupted_turn_must_be_resumed_before_a_new_one(log):
     sid = log.new_session()
     log.append(sid, "user_message", {"text": "go"})
     log.append(sid, "assistant_message",
                {"text": "", "tool_calls": [{"id": "c1", "name": "echo", "arguments": {}}]})
 
     session = Session.open(log, sid, FakeModel([]), ToolRegistry([_echo()]))
-    with pytest.raises(OpenToolCalls):
+    with pytest.raises(TurnInProgress):
         session.run_turn("hello?")
     assert len(log.load(sid)) == 2  # nothing was written
 

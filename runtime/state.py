@@ -12,8 +12,10 @@ Event types and payloads:
     approval_requested  {call_id}
     approval_decided    {call_id, decision: approve | approve_for_session | deny, feedback, source}
     tool_started        {call_id}
-    tool_finished       {call_id, output, is_error}
+    tool_restarted      {call_id}               re-run after a crash interrupted it
+    tool_finished       {call_id, output, is_error, interrupted?}
     tool_skipped        {call_id, reason}
+    turn_stopped        {reason}                the turn ended without a final answer
 
 A tool call's status moves through these transitions, one event each:
 
@@ -25,6 +27,10 @@ A tool call's status moves through these transitions, one event each:
 Because each step is its own event, a crash leaves the call in the status it had reached:
 `awaiting_approval` (nobody answered yet) or `started` (the tool may or may not have run).
 `approve_for_session` decisions are collected in `approved_tools`, so they survive a restart.
+
+`turn_open` is True from a user message until the turn ends, either with an assistant reply
+that has no tool calls or with `turn_stopped`. If it is still True after replay, the process
+died mid-turn and the turn can be resumed.
 Events that break this order (finishing a call that never started, an unknown type, ...) mean
 the log is corrupt, and replay stops with InvalidEventSequence rather than guessing.
 """
@@ -59,6 +65,7 @@ class SessionState:
     tool_calls: dict[str, ToolCallState] = field(default_factory=dict)  # every call, by id
     open_calls: dict[str, ToolCallState] = field(default_factory=dict)  # not finished, in call order
     approved_tools: set[str] = field(default_factory=set)  # approved for the rest of the session
+    turn_open: bool = False
     last_seq: int = 0
 
     def unfinished_calls(self) -> list[ToolCallState]:
@@ -92,9 +99,11 @@ def apply(state: SessionState, event: Event) -> None:
 
 
 def _on_user_message(state: SessionState, event: Event) -> None:
-    """A user message is only valid when no tool call from the previous reply is still open."""
-    _require_no_open_calls(state, event)
+    """Start a turn. Only valid once the previous turn has ended."""
+    if state.turn_open:
+        raise InvalidEventSequence(f"seq {event.seq}: user_message while a turn is still open")
     state.messages.append(Message(role="user", text=event.payload["text"]))
+    state.turn_open = True
 
 
 def _on_assistant_message(state: SessionState, event: Event) -> None:
@@ -123,6 +132,8 @@ def _on_assistant_message(state: SessionState, event: Event) -> None:
             tool_calls=calls,
         )
     )
+    if not calls:
+        state.turn_open = False  # a reply without tool calls is the final answer
 
 
 def _on_approval_requested(state: SessionState, event: Event) -> None:
@@ -160,6 +171,11 @@ def _on_tool_started(state: SessionState, event: Event) -> None:
     tool.status = ToolCallStatus.STARTED
 
 
+def _on_tool_restarted(state: SessionState, event: Event) -> None:
+    """STARTED -> STARTED. Records that a call interrupted by a crash is being run again."""
+    _require_call(state, event, expected={ToolCallStatus.STARTED})
+
+
 def _on_tool_finished(state: SessionState, event: Event) -> None:
     """STARTED -> FINISHED, with the tool's output as the result."""
     tool = _require_call(state, event, expected={ToolCallStatus.STARTED})
@@ -170,6 +186,14 @@ def _on_tool_skipped(state: SessionState, event: Event) -> None:
     """REQUESTED -> FINISHED without running, with the reason as an error result."""
     tool = _require_call(state, event, expected={ToolCallStatus.REQUESTED})
     _finish(state, tool, event.payload["reason"], is_error=True)
+
+
+def _on_turn_stopped(state: SessionState, event: Event) -> None:
+    """End the turn without a final answer (denied, step limit, truncated reply)."""
+    _require_no_open_calls(state, event)
+    if not state.turn_open:
+        raise InvalidEventSequence(f"seq {event.seq}: turn_stopped with no open turn")
+    state.turn_open = False
 
 
 def _finish(state: SessionState, tool: ToolCallState, text: str, is_error: bool) -> None:
@@ -217,6 +241,8 @@ _HANDLERS = {
     "approval_requested": _on_approval_requested,
     "approval_decided": _on_approval_decided,
     "tool_started": _on_tool_started,
+    "tool_restarted": _on_tool_restarted,
     "tool_finished": _on_tool_finished,
     "tool_skipped": _on_tool_skipped,
+    "turn_stopped": _on_turn_stopped,
 }
