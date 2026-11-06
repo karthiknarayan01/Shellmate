@@ -460,6 +460,10 @@ There is always at most one live region on screen: the spinner, or the answer be
 
 **Ctrl+C.** During a turn it is a signal handler that cancels the turn's task, so it never stops the event loop; the cancelled turn is then ended with `Session.cancel()`. At a prompt it ends the chat.
 
+### 11.1 `start.sh`
+
+The script in the repository root wraps the CLI for people who just want to chat. It keeps a virtual environment in `.venv` (reinstalled when `pyproject.toml` changes, detected with `cksum`) and a saved choice in `~/.config/agent-runtime/config`: `PROVIDER`, `MODEL` and, when typed in, the API key, in a file only the user can read. The file is parsed as `KEY=value` lines, not sourced. With no saved choice, or with `--setup`, it asks for one; for Ollama it then installs Ollama if missing (after asking), starts it (the macOS app, or `ollama serve` in the background with its log in `~/.local/state/agent-runtime/ollama.log`), waits for `/api/version` to answer, and pulls the model if `ollama show` doesn't find it. Every run ends with `exec agent-runtime --provider P --model M "$@"`, so any other option reaches the CLI unchanged and the shell doesn't stay behind it.
+
 ## 12. Tests
 
 `python -m pytest -q` (install with `pip install -e ".[dev]"`). Every test uses a scripted fake model (`tests/fake_model.py`), so the suite needs no API key and no network, except two smoke tests that run only when a real key is set. CI runs it on Python 3.11 and 3.13 for every pull request.
@@ -477,6 +481,7 @@ The tests that check the central guarantees:
 | a reply's text is streamed before its event and never logged; streamed chunks rebuild the same reply | `test_subscriptions.py`, `test_deepseek_model.py`, `test_anthropic_model.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |
+| `start.sh` sets up each provider once, then goes straight to the chat | `test_start_script.py` (fake Ollama and CLI) |
 
 ## 13. Limits
 
