@@ -277,6 +277,64 @@ def test_restart_of_a_call_that_never_started_is_rejected():
     with pytest.raises(InvalidEventSequence, match="expected started"):
         project(_tool_turn(("tool_restarted", {"call_id": "c1"})))
 
+
+# ── compaction and token measurement ─────────────────────────────────────────────────────
+
+
+def test_compaction_replaces_the_first_messages_with_the_summary():
+    state = project(_events(
+        ("user_message", {"text": "q1"}),
+        ("assistant_message", {"text": "a1", "tool_calls": []}),
+        ("user_message", {"text": "q2"}),
+        ("compaction", {"replaced_count": 2, "summary": "they talked"}),
+    ))
+    assert [(m.role, m.text) for m in state.messages] == [("user", "they talked"), ("user", "q2")]
+
+
+def test_usage_is_recorded_as_a_measurement_and_reset_by_compaction():
+    usage = {"input_tokens": 900, "output_tokens": 100}
+    events = [
+        ("user_message", {"text": "q1"}),
+        ("assistant_message", {"text": "a1", "tool_calls": [], "usage": usage}),
+        ("user_message", {"text": "q2"}),
+    ]
+    state = project(_events(*events))
+    assert (state.measured_tokens, state.measured_through) == (1_000, 2)
+    state = project(_events(*events, ("compaction", {"replaced_count": 2, "summary": "s"})))
+    assert state.measured_tokens is None
+
+
+def test_zero_usage_is_not_a_measurement():
+    state = project(_events(
+        ("user_message", {"text": "q"}),
+        ("assistant_message", {"text": "a", "tool_calls": [], "usage": {"input_tokens": 0, "output_tokens": 0}}),
+    ))
+    assert state.measured_tokens is None
+
+
+def test_turn_request_is_the_latest_user_message():
+    assert project(_events(("user_message", {"text": "fix the bug"}))).turn_request == "fix the bug"
+
+
+@pytest.mark.parametrize(
+    "count, error",
+    [(0, "compaction of 0"), (3, "compaction of 3"), (2, "orphan a tool result")],
+    ids=["nothing", "everything", "orphans-result"],
+)
+def test_invalid_compactions_are_rejected(count, error):
+    events = _tool_turn(
+        ("tool_started", {"call_id": "c1"}),
+        ("tool_finished", {"call_id": "c1", "output": "ok", "is_error": False}),
+        ("compaction", {"replaced_count": count, "summary": "s"}),
+    )
+    with pytest.raises(InvalidEventSequence, match=error):
+        project(events)
+
+
+def test_compaction_with_open_calls_is_rejected():
+    with pytest.raises(InvalidEventSequence, match="have no result"):
+        project(_tool_turn(("compaction", {"replaced_count": 1, "summary": "s"})))
+
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
 
 

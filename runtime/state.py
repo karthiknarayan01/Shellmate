@@ -16,6 +16,8 @@ Event types and payloads:
     tool_finished       {call_id, output, is_error, interrupted?}
     tool_skipped        {call_id, reason}
     turn_stopped        {reason}                the turn ended without a final answer
+    compaction          {replaced_count, summary}  the first replaced_count messages are
+                                                   replaced by one summary message
 
 A tool call's status moves through these transitions, one event each:
 
@@ -31,6 +33,10 @@ Because each step is its own event, a crash leaves the call in the status it had
 `turn_open` is True from a user message until the turn ends, either with an assistant reply
 that has no tool calls or with `turn_stopped`. If it is still True after replay, the process
 died mid-turn and the turn can be resumed.
+
+`measured_tokens` is the provider's own count (input + output) from the latest reply, and
+`measured_through` is how many messages it covers; messages after that are estimated. Both
+reset on compaction, since the provider hasn't seen the compacted history yet.
 Events that break this order (finishing a call that never started, an unknown type, ...) mean
 the log is corrupt, and replay stops with InvalidEventSequence rather than guessing.
 """
@@ -66,6 +72,9 @@ class SessionState:
     open_calls: dict[str, ToolCallState] = field(default_factory=dict)  # not finished, in call order
     approved_tools: set[str] = field(default_factory=set)  # approved for the rest of the session
     turn_open: bool = False
+    turn_request: str = ""  # the user message that started the current or last turn
+    measured_tokens: int | None = None
+    measured_through: int = 0
     last_seq: int = 0
 
     def unfinished_calls(self) -> list[ToolCallState]:
@@ -104,6 +113,7 @@ def _on_user_message(state: SessionState, event: Event) -> None:
         raise InvalidEventSequence(f"seq {event.seq}: user_message while a turn is still open")
     state.messages.append(Message(role="user", text=event.payload["text"]))
     state.turn_open = True
+    state.turn_request = event.payload["text"]
 
 
 def _on_assistant_message(state: SessionState, event: Event) -> None:
@@ -134,6 +144,10 @@ def _on_assistant_message(state: SessionState, event: Event) -> None:
     )
     if not calls:
         state.turn_open = False  # a reply without tool calls is the final answer
+    usage = event.payload.get("usage")
+    if usage and usage["input_tokens"] > 0:  # 0 means the client didn't report usage
+        state.measured_tokens = usage["input_tokens"] + usage["output_tokens"]
+        state.measured_through = len(state.messages)
 
 
 def _on_approval_requested(state: SessionState, event: Event) -> None:
@@ -196,6 +210,26 @@ def _on_turn_stopped(state: SessionState, event: Event) -> None:
     state.turn_open = False
 
 
+def _on_compaction(state: SessionState, event: Event) -> None:
+    """Replace the oldest messages with one summary message.
+
+    Only valid between steps (no open tool calls), and the kept part must not start with a
+    tool result, which would be cut off from the tool call it answers.
+    """
+    _require_no_open_calls(state, event)
+    count = event.payload["replaced_count"]
+    if not 0 < count < len(state.messages):
+        raise InvalidEventSequence(
+            f"seq {event.seq}: compaction of {count} messages, history has {len(state.messages)}"
+        )
+    if state.messages[count].role == "tool":
+        raise InvalidEventSequence(f"seq {event.seq}: compaction would orphan a tool result")
+    summary = Message(role="user", text=event.payload["summary"])
+    state.messages = [summary, *state.messages[count:]]
+    state.measured_tokens = None
+    state.measured_through = 0
+
+
 def _finish(state: SessionState, tool: ToolCallState, text: str, is_error: bool) -> None:
     """Close a call and add its result to the conversation as a tool message."""
     tool.status = ToolCallStatus.FINISHED
@@ -245,4 +279,5 @@ _HANDLERS = {
     "tool_finished": _on_tool_finished,
     "tool_skipped": _on_tool_skipped,
     "turn_stopped": _on_turn_stopped,
+    "compaction": _on_compaction,
 }
