@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🐚 Shellmate
+# Shellmate
 
 **An AI assistant in your terminal that works on your files and searches the web.**<br>
 Free and private on your own computer, or with Claude and DeepSeek.
