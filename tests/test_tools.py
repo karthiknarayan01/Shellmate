@@ -50,6 +50,18 @@ def test_arguments_the_model_could_not_encode_are_an_error_result(registry):
     assert result.is_error and "not valid JSON" in result.output
 
 
+def test_check_reports_problems_without_running(registry):
+    assert registry.check(ToolCall("c", "add", {"a": 1, "b": 2})) is None
+    assert registry.check(ToolCall("c", "add", {"a": 1})).is_error
+
+
+def test_only_tools_marked_as_such_require_approval():
+    registry = ToolRegistry([Tool("read", "", {}, str), Tool("write", "", {}, str, requires_approval=True)])
+    assert registry.requires_approval("write")
+    assert not registry.requires_approval("read")
+    assert not registry.requires_approval("unknown")
+
+
 def test_duplicate_names_are_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         ToolRegistry([Tool("x", "", {}, str), Tool("x", "", {}, str)])

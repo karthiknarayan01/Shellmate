@@ -7,13 +7,24 @@ restarted process recovers exactly where the previous one stopped.
 
 Event types and payloads:
 
-    user_message       {text}
-    assistant_message  {text, reasoning?, tool_calls: [{id, name, arguments, arguments_error?}]}
-    tool_started       {call_id}
-    tool_finished      {call_id, output, is_error}
+    user_message        {text}
+    assistant_message   {text, reasoning?, tool_calls: [{id, name, arguments, arguments_error?}]}
+    approval_requested  {call_id}
+    approval_decided    {call_id, decision: approve | approve_for_session | deny, feedback, source}
+    tool_started        {call_id}
+    tool_finished       {call_id, output, is_error}
+    tool_skipped        {call_id, reason}
 
-A tool call moves requested -> started -> finished. Each step is a separate event, so a crash
-between `tool_started` and `tool_finished` is visible after replay as a call left in `started`.
+A tool call's status moves through these transitions, one event each:
+
+    requested --approval_requested--> awaiting_approval --approval_decided(approve)--> approved
+    requested | approved --tool_started--> started --tool_finished--> finished
+    awaiting_approval --approval_decided(deny)--> finished   (never started)
+    requested --tool_skipped--> finished                     (never started)
+
+Because each step is its own event, a crash leaves the call in the status it had reached:
+`awaiting_approval` (nobody answered yet) or `started` (the tool may or may not have run).
+`approve_for_session` decisions are collected in `approved_tools`, so they survive a restart.
 Events that break this order (finishing a call that never started, an unknown type, ...) mean
 the log is corrupt, and replay stops with InvalidEventSequence rather than guessing.
 """
@@ -29,9 +40,11 @@ from runtime.messages import Message, ToolCall
 
 
 class ToolCallStatus(Enum):
-    REQUESTED = "requested"  # the model asked for it; it has not started
+    REQUESTED = "requested"  # the model asked for it; nothing has happened yet
+    AWAITING_APPROVAL = "awaiting_approval"  # approval asked for; no answer yet
+    APPROVED = "approved"  # approved; not started yet
     STARTED = "started"  # tool_started written; no result yet
-    FINISHED = "finished"  # tool_finished written; the result is in `messages`
+    FINISHED = "finished"  # has a result in `messages` (ran, denied or skipped)
 
 
 @dataclass(slots=True)
@@ -45,6 +58,7 @@ class SessionState:
     messages: list[Message] = field(default_factory=list)
     tool_calls: dict[str, ToolCallState] = field(default_factory=dict)  # every call, by id
     open_calls: dict[str, ToolCallState] = field(default_factory=dict)  # not finished, in call order
+    approved_tools: set[str] = field(default_factory=set)  # approved for the rest of the session
     last_seq: int = 0
 
     def unfinished_calls(self) -> list[ToolCallState]:
@@ -111,24 +125,59 @@ def _on_assistant_message(state: SessionState, event: Event) -> None:
     )
 
 
+def _on_approval_requested(state: SessionState, event: Event) -> None:
+    """REQUESTED -> AWAITING_APPROVAL."""
+    tool = _require_call(state, event, expected={ToolCallStatus.REQUESTED})
+    tool.status = ToolCallStatus.AWAITING_APPROVAL
+
+
+def _on_approval_decided(state: SessionState, event: Event) -> None:
+    """AWAITING_APPROVAL -> APPROVED, or -> FINISHED with a "denied" result for the model."""
+    tool = _require_call(state, event, expected={ToolCallStatus.AWAITING_APPROVAL})
+    decision = event.payload["decision"]
+    if decision == "deny":
+        _finish(state, tool, denial_message(event.payload.get("feedback", "")), is_error=True)
+        return
+    if decision == "approve_for_session":
+        state.approved_tools.add(tool.call.name)
+    elif decision != "approve":
+        raise InvalidEventSequence(f"seq {event.seq}: unknown decision {decision!r}")
+    tool.status = ToolCallStatus.APPROVED
+
+
+def denial_message(feedback: str) -> str:
+    """The tool result the model sees for a denied call."""
+    if feedback:
+        return f"The user denied this tool call. Their feedback: {feedback}"
+    return "The user denied this tool call."
+
+
 def _on_tool_started(state: SessionState, event: Event) -> None:
-    """REQUESTED -> STARTED."""
-    tool = _require_call(state, event, expected=ToolCallStatus.REQUESTED)
+    """REQUESTED or APPROVED -> STARTED."""
+    tool = _require_call(
+        state, event, expected={ToolCallStatus.REQUESTED, ToolCallStatus.APPROVED}
+    )
     tool.status = ToolCallStatus.STARTED
 
 
 def _on_tool_finished(state: SessionState, event: Event) -> None:
-    """STARTED -> FINISHED, and add the result to the conversation as a tool message."""
-    tool = _require_call(state, event, expected=ToolCallStatus.STARTED)
+    """STARTED -> FINISHED, with the tool's output as the result."""
+    tool = _require_call(state, event, expected={ToolCallStatus.STARTED})
+    _finish(state, tool, event.payload["output"], event.payload.get("is_error", False))
+
+
+def _on_tool_skipped(state: SessionState, event: Event) -> None:
+    """REQUESTED -> FINISHED without running, with the reason as an error result."""
+    tool = _require_call(state, event, expected={ToolCallStatus.REQUESTED})
+    _finish(state, tool, event.payload["reason"], is_error=True)
+
+
+def _finish(state: SessionState, tool: ToolCallState, text: str, is_error: bool) -> None:
+    """Close a call and add its result to the conversation as a tool message."""
     tool.status = ToolCallStatus.FINISHED
     del state.open_calls[tool.call.id]
     state.messages.append(
-        Message(
-            role="tool",
-            text=event.payload["output"],
-            tool_call_id=tool.call.id,
-            is_error=event.payload.get("is_error", False),
-        )
+        Message(role="tool", text=text, tool_call_id=tool.call.id, is_error=is_error)
     )
 
 
@@ -145,16 +194,19 @@ def _require_no_open_calls(state: SessionState, event: Event) -> None:
         )
 
 
-def _require_call(state: SessionState, event: Event, expected: ToolCallStatus) -> ToolCallState:
-    """Look up the call an event refers to and check it is in the status the event moves it from."""
+def _require_call(
+    state: SessionState, event: Event, expected: set[ToolCallStatus]
+) -> ToolCallState:
+    """Look up the call an event refers to and check it is in a status the event moves it from."""
     call_id = event.payload["call_id"]
     tool = state.tool_calls.get(call_id)
     if tool is None:
         raise InvalidEventSequence(f"seq {event.seq}: {event.type} for unknown call {call_id!r}")
-    if tool.status is not expected:
+    if tool.status not in expected:
+        allowed = " or ".join(sorted(s.value for s in expected))
         raise InvalidEventSequence(
             f"seq {event.seq}: {event.type} for call {call_id!r} in status {tool.status.value}, "
-            f"expected {expected.value}"
+            f"expected {allowed}"
         )
     return tool
 
@@ -162,6 +214,9 @@ def _require_call(state: SessionState, event: Event, expected: ToolCallStatus) -
 _HANDLERS = {
     "user_message": _on_user_message,
     "assistant_message": _on_assistant_message,
+    "approval_requested": _on_approval_requested,
+    "approval_decided": _on_approval_decided,
     "tool_started": _on_tool_started,
     "tool_finished": _on_tool_finished,
+    "tool_skipped": _on_tool_skipped,
 }

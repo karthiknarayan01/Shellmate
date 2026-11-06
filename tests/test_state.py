@@ -134,7 +134,7 @@ def test_finish_without_start_is_rejected():
 
 
 def test_starting_twice_is_rejected():
-    with pytest.raises(InvalidEventSequence, match="expected requested"):
+    with pytest.raises(InvalidEventSequence, match="expected approved or requested"):
         project(_tool_turn(("tool_started", {"call_id": "c1"}), ("tool_started", {"call_id": "c1"})))
 
 
@@ -152,6 +152,75 @@ def test_duplicate_call_ids_are_rejected():
                 ("assistant_message", {"text": "", "tool_calls": [call, call]}),
             )
         )
+
+
+# ── approvals and skips ──────────────────────────────────────────────────────────────────
+
+
+def test_approved_call_runs_after_approval():
+    state = project(_tool_turn(
+        ("approval_requested", {"call_id": "c1"}),
+        ("approval_decided", {"call_id": "c1", "decision": "approve", "feedback": "", "source": "approver"}),
+        ("tool_started", {"call_id": "c1"}),
+        ("tool_finished", {"call_id": "c1", "output": "done", "is_error": False}),
+    ))
+    assert state.messages[-1].text == "done"
+    assert state.approved_tools == set()
+
+
+def test_waiting_for_approval_is_visible_after_replay():
+    state = project(_tool_turn(("approval_requested", {"call_id": "c1"})))
+    assert state.tool_calls["c1"].status is ToolCallStatus.AWAITING_APPROVAL
+    assert [t.call.id for t in state.unfinished_calls()] == ["c1"]
+
+
+@pytest.mark.parametrize(
+    "feedback, text",
+    [("", "The user denied this tool call."),
+     ("edit b.py instead", "The user denied this tool call. Their feedback: edit b.py instead")],
+    ids=["no-feedback", "with-feedback"],
+)
+def test_denied_call_is_finished_with_a_denial_result(feedback, text):
+    state = project(_tool_turn(
+        ("approval_requested", {"call_id": "c1"}),
+        ("approval_decided", {"call_id": "c1", "decision": "deny", "feedback": feedback, "source": "approver"}),
+    ))
+    assert state.tool_calls["c1"].status is ToolCallStatus.FINISHED
+    assert state.messages[-1] == Message(role="tool", text=text, tool_call_id="c1", is_error=True)
+
+
+def test_approve_for_session_is_remembered():
+    state = project(_tool_turn(
+        ("approval_requested", {"call_id": "c1"}),
+        ("approval_decided", {"call_id": "c1", "decision": "approve_for_session", "feedback": "", "source": "approver"}),
+    ))
+    assert state.approved_tools == {"t"}
+
+
+def test_skipped_call_gets_an_error_result_without_starting():
+    state = project(_tool_turn(("tool_skipped", {"call_id": "c1", "reason": "skipped: denied"})))
+    assert state.messages[-1].text == "skipped: denied" and state.messages[-1].is_error
+    assert state.open_calls == {}
+
+
+@pytest.mark.parametrize(
+    "tail, error",
+    [
+        ((("approval_decided", {"call_id": "c1", "decision": "approve", "feedback": "", "source": "x"}),),
+         "expected awaiting_approval"),
+        ((("approval_requested", {"call_id": "c1"}), ("tool_started", {"call_id": "c1"})),
+         "expected approved or requested"),
+        ((("approval_requested", {"call_id": "c1"}),
+          ("approval_decided", {"call_id": "c1", "decision": "maybe", "feedback": "", "source": "x"})),
+         "unknown decision"),
+        ((("tool_started", {"call_id": "c1"}), ("tool_skipped", {"call_id": "c1", "reason": "r"})),
+         "expected requested"),
+    ],
+    ids=["decided-without-request", "started-while-awaiting", "unknown-decision", "skip-after-start"],
+)
+def test_out_of_order_approval_events_are_rejected(tail, error):
+    with pytest.raises(InvalidEventSequence, match=error):
+        project(_tool_turn(*tail))
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────

@@ -1,9 +1,13 @@
 """Tool registry: the tools a session may use, and running one tool call safely.
 
-A tool is a name, a description, a JSON schema for its arguments, and a Python function.
-`ToolRegistry.run()` never raises for a bad call: an unknown tool, arguments that are not
-valid JSON or fail the schema, or an exception inside the tool all come back as an error
-result, which the model sees and can recover from.
+A tool is a name, a description, a JSON schema for its arguments, a Python function, and
+whether it needs approval before it runs (any tool that changes something should).
+
+Running a call has two parts, so the session can ask for approval in between:
+    check(call)    is the call well-formed? (known tool, valid JSON, matches the schema)
+    execute(call)  run the function
+Neither raises for a bad call: problems come back as an error ToolResult, which the model sees
+and can recover from.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ class Tool:
     description: str
     input_schema: dict[str, Any]
     fn: Callable[..., str]  # called with the validated arguments as keyword arguments
+    requires_approval: bool = False
 
     def spec(self) -> ToolSpec:
         return ToolSpec(self.name, self.description, self.input_schema)
@@ -47,7 +52,11 @@ class ToolRegistry:
         return [t.spec() for t in self._tools.values()]
 
     def run(self, call: ToolCall) -> ToolResult:
-        """Validate and run one call. Every failure is returned as an error result."""
+        """check() then execute(), for callers that don't need approval in between."""
+        return self.check(call) or self.execute(call)
+
+    def check(self, call: ToolCall) -> ToolResult | None:
+        """An error result if the call can't run as given, otherwise None."""
         tool = self._tools.get(call.name)
         if tool is None:
             return ToolResult(f"unknown tool {call.name!r}", is_error=True)
@@ -58,7 +67,15 @@ class ToolRegistry:
             jsonschema.validate(call.arguments, tool.input_schema)
         except jsonschema.ValidationError as e:
             return ToolResult(f"invalid arguments for {call.name}: {e.message}", is_error=True)
+        return None
+
+    def execute(self, call: ToolCall) -> ToolResult:
+        """Run a call that passed check(). An exception inside the tool becomes an error result."""
         try:
-            return ToolResult(str(tool.fn(**call.arguments)))
+            return ToolResult(str(self._tools[call.name].fn(**call.arguments)))
         except Exception as e:
             return ToolResult(f"{call.name} failed: {type(e).__name__}: {e}", is_error=True)
+
+    def requires_approval(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return tool is not None and tool.requires_approval

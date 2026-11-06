@@ -21,7 +21,7 @@ def test_turn_without_tools_returns_the_reply(log):
     model = FakeModel([say("hello")])
     session = Session.create(log, model, ToolRegistry([]))
 
-    assert session.run_turn("hi") == "hello"
+    assert session.run_turn("hi").text == "hello"
     assert [m.role for m in session.state.messages] == ["user", "assistant"]
 
 
@@ -29,7 +29,7 @@ def test_tool_result_is_sent_back_to_the_model(log):
     model = FakeModel([call("echo", text="ping"), say("got pong")])
     session = Session.create(log, model, ToolRegistry([_echo()]))
 
-    assert session.run_turn("go") == "got pong"
+    assert session.run_turn("go").text == "got pong"
     second_request = model.requests[1].messages
     assert [m.role for m in second_request] == ["user", "assistant", "tool"]
     assert second_request[-1].text == "pong:ping"
@@ -50,7 +50,7 @@ def test_tool_errors_go_back_to_the_model_and_the_turn_continues(log):
     model = FakeModel([call("missing_tool"), say("sorry")])
     session = Session.create(log, model, ToolRegistry([]))
 
-    assert session.run_turn("go") == "sorry"
+    assert session.run_turn("go").text == "sorry"
     result = model.requests[1].messages[-1]
     assert result.is_error and "unknown tool" in result.text
 
@@ -103,7 +103,7 @@ def test_open_continues_a_session_from_the_log(log):
 
     model = FakeModel([say("two")])
     reopened = Session.open(log, first.session_id, model, ToolRegistry([]))
-    assert reopened.run_turn("second") == "two"
+    assert reopened.run_turn("second").text == "two"
     assert [m.text for m in model.requests[0].messages] == ["first", "one", "second"]
 
 
