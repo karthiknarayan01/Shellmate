@@ -4,11 +4,12 @@ except the smoke test, which runs only when ANTHROPIC_API_KEY is set."""
 import os
 from types import SimpleNamespace as NS
 
+import anthropic
 import pytest
 
 from runtime.anthropic_model import AnthropicModel, from_api_response, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ToolSpec, Usage
 
 
 def test_user_and_assistant_messages():
@@ -69,6 +70,21 @@ def test_default_output_cap_is_sent(monkeypatch):
         content=[], usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")))
     AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
     assert sent["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+def test_missing_api_key_fails_clearly(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        AnthropicModel()
+
+
+def test_api_failures_become_model_errors():
+    def create(**kwargs):
+        raise anthropic.APIConnectionError(request=None)
+
+    model = AnthropicModel(client=NS(messages=NS(create=create)))
+    with pytest.raises(ModelError, match="Anthropic API error"):
+        model.complete("s", [Message("user", "hi")], [])
 
 
 def test_request_carries_model_system_and_tools():

@@ -219,7 +219,7 @@ def test_skipped_call_gets_an_error_result_without_starting():
           ("approval_decided", {"call_id": "c1", "decision": "maybe", "feedback": "", "source": "x"})),
          "unknown decision"),
         ((("tool_started", {"call_id": "c1"}), ("tool_skipped", {"call_id": "c1", "reason": "r"})),
-         "expected requested"),
+         "in status started"),
     ],
     ids=["decided-without-request", "started-while-awaiting", "unknown-decision", "skip-after-start"],
 )

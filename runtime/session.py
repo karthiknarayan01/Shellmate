@@ -32,7 +32,7 @@ its side effect happened before the crash.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 from runtime.approval import Approver, Decision, DenyAll
 from runtime.compaction import (
@@ -44,7 +44,7 @@ from runtime.compaction import (
     render_transcript,
     summary_message_text,
 )
-from runtime.events import EventLog
+from runtime.events import Event, EventLog
 from runtime.messages import Message, ToolCall
 from runtime.model import ModelClient
 from runtime.state import SessionState, ToolCallState, ToolCallStatus, apply, project
@@ -97,11 +97,13 @@ class Session:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 20,
         compaction: CompactionPolicy | None = None,
+        observer: Callable[[Event], None] | None = None,
     ):
         """Use Session.create() or Session.open() rather than calling this directly.
 
         Without an approver, every tool that requires approval is denied. Without a compaction
-        policy, the context window comes from AGENT_CONTEXT_WINDOW or the default.
+        policy, the context window comes from AGENT_CONTEXT_WINDOW or the default. `observer`
+        is called with every event right after it is recorded (a UI uses it to show progress).
         """
         self.log = log
         self.session_id = session_id
@@ -112,6 +114,7 @@ class Session:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.compaction = compaction or policy_from_env()
+        self.observer = observer
 
     @classmethod
     def create(cls, log: EventLog, model: ModelClient, tools: ToolRegistry, **options: Any) -> Session:
@@ -148,6 +151,21 @@ class Session:
         if denied is not None:
             return self._stop_after_denial(denied)
         return self._continue_turn()
+
+    def cancel(self) -> None:
+        """End an interrupted turn without running anything more (the user pressed Ctrl+C).
+
+        Calls that never started are skipped. A call that had started gets the interrupted
+        result, since it may have had its effect. Then the turn is recorded as stopped.
+        """
+        if not self.state.turn_open:
+            return
+        for tool in self.state.unfinished_calls():
+            if tool.status is ToolCallStatus.STARTED:
+                self._finish(tool.call, INTERRUPTED_RESULT, is_error=True, interrupted=True)
+            else:
+                self._record("tool_skipped", {"call_id": tool.call.id, "reason": "cancelled by the user"})
+        self._record("turn_stopped", {"reason": "cancelled"})
 
     def _continue_turn(self) -> TurnResult:
         """Model steps until a final answer, a denial that stops the turn, or the step limit."""
@@ -304,5 +322,8 @@ class Session:
         return TurnResult(last_text, denied_call=denied)
 
     def _record(self, type: str, payload: dict[str, Any]) -> None:
-        """Append the event (durable once this returns), then fold it into the state."""
-        apply(self.state, self.log.append(self.session_id, type, payload))
+        """Append the event (durable once this returns), fold it into the state, tell the observer."""
+        event = self.log.append(self.session_id, type, payload)
+        apply(self.state, event)
+        if self.observer is not None:
+            self.observer(event)

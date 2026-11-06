@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import os
+
 import anthropic
 
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelReply, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ModelReply, ToolSpec, Usage
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 # Above this, the SDK refuses non-streaming requests (they could run past 10 minutes).
@@ -35,20 +37,25 @@ class AnthropicModel:
             )
         self._model = model
         self._max_tokens = max_tokens
+        if client is None and not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY is not set")
         self._client = client or anthropic.Anthropic(max_retries=max_retries)
 
     def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
-        """Send one request and return the parsed reply."""
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=to_api_messages(messages),
-            tools=[
-                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-                for t in tools
-            ],
-        )
+        """Send one request and return the parsed reply. API failures raise ModelError."""
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=system,
+                messages=to_api_messages(messages),
+                tools=[
+                    {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                    for t in tools
+                ],
+            )
+        except anthropic.APIError as e:
+            raise ModelError(f"Anthropic API error: {e}") from e
         return from_api_response(response)
 
 
