@@ -114,6 +114,24 @@ def test_thinking_is_shown_once_while_the_model_reasons(tmp_path, monkeypatch):
     assert "carefully" not in out  # the reasoning itself isn't printed
 
 
+def test_web_tools_and_a_dated_prompt_are_given_to_the_model(tmp_path, monkeypatch):
+    model = FakeModel([say("ok")])
+    _use_model(monkeypatch, model)
+    _run(tmp_path, [], ["hi"])
+    request = model.requests[0]
+    assert {"web_search", "read_web_page"} <= {t.name for t in request.tools}
+    assert "Today's date is" in request.system and "web_search" in request.system
+
+
+def test_no_web_flag_removes_the_web_tools(tmp_path, monkeypatch):
+    model = FakeModel([say("ok")])
+    _use_model(monkeypatch, model)
+    _run(tmp_path, ["--no-web"], ["hi"])
+    request = model.requests[0]
+    assert not {"web_search", "read_web_page"} & {t.name for t in request.tools}
+    assert "web_search" not in request.system
+
+
 def test_yes_flag_approves_without_asking(tmp_path, monkeypatch):
     workspace = tmp_path / "ws"
     workspace.mkdir()

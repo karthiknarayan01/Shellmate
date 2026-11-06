@@ -6,7 +6,7 @@ A small, crash-safe runtime for tool-using AI agents, written from scratch in Py
 - **tools that change things ask first.** You approve, approve for the rest of the session, or deny (with optional feedback for the model). A denied tool never runs.
 - **long sessions keep their goal.** When the conversation nears the model's context window, older messages are summarized and your current request is kept word for word.
 
-It comes with a terminal chat and three workspace tools (`list_files`, `read_file`, `write_file`), all confined to one directory. How it works inside: [docs/architecture.md](docs/architecture.md).
+It comes with a terminal chat, three workspace tools (`list_files`, `read_file`, `write_file`) confined to one directory, and two web tools (`web_search`, `read_web_page`) for news and anything current. Web search is free and needs no key or account. How it works inside: [docs/architecture.md](docs/architecture.md).
 
 ## Setup
 
@@ -43,6 +43,7 @@ agent-runtime --workspace ~/project    let the tools work in another directory
 agent-runtime --resume latest          continue the most recent session
 agent-runtime --resume <session id>    continue a specific session (the id is printed at start)
 agent-runtime --yes                    approve every tool call without asking
+agent-runtime --no-web                 don't give the agent web search
 agent-runtime --db sessions.db         keep sessions in another file (default agent.db)
 ```
 

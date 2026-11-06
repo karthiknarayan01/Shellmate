@@ -5,6 +5,7 @@
     agent-runtime --resume latest              continue the most recent session
     agent-runtime --resume <session id>        continue a specific session
     agent-runtime --yes                        approve every tool without asking
+    agent-runtime --no-web                     turn off the web search tools
 
 On start it migrates the database, opens or creates the session, and finishes any turn a crash
 left unfinished. Then it reads one message per prompt and runs a turn for it. Tools that change
@@ -35,6 +36,7 @@ import json
 import signal
 import sys
 import threading
+from datetime import date
 from pathlib import Path
 from typing import Awaitable, Callable, TextIO
 
@@ -43,6 +45,7 @@ from runtime.events import Event, EventLog
 from runtime.messages import ToolCall
 from runtime.migrate import migrate
 from runtime.model import ModelError, StreamDelta
+from runtime.prompts import system_prompt
 from runtime.providers import PROVIDERS, make_model
 from runtime.session import (
     CompactionFailed,
@@ -54,6 +57,7 @@ from runtime.session import (
 )
 from runtime.subscriptions import EventStream
 from runtime.tools import ToolRegistry
+from runtime.web_tools import web_tools
 from runtime.workspace_tools import workspace_tools
 
 DEFAULT_DB = "agent.db"
@@ -85,6 +89,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--model", help="model name (default: the provider's default)")
     parser.add_argument("--resume", metavar="SESSION", help="session id to continue, or 'latest'")
     parser.add_argument("--yes", action="store_true", help="approve every tool call without asking")
+    parser.add_argument("--no-web", action="store_true", help="don't give the agent web search")
     return parser.parse_args(argv)
 
 
@@ -107,15 +112,17 @@ def open_session(log: EventLog, args: argparse.Namespace, terminal: Terminal, ou
         model = make_model(args.provider, args.model)
     except (RuntimeError, ValueError) as e:
         raise SystemExit(str(e)) from None
-    tools = ToolRegistry(workspace_tools(Path(args.workspace)))
+    web = not args.no_web
+    tools = ToolRegistry(workspace_tools(Path(args.workspace)) + (web_tools() if web else []))
     approver: Approver = AutoApprove() if args.yes else TerminalApprover(terminal, out)
+    options = {"approver": approver, "system_prompt": system_prompt(date.today(), web)}
     if args.resume is None:
-        session = Session.create(log, model, tools, approver=approver)
+        session = Session.create(log, model, tools, **options)
     else:
         session_id = log.latest_session() if args.resume == "latest" else args.resume
         if session_id is None or not log.has_session(session_id):
             raise SystemExit(f"no session to resume: {args.resume}")
-        session = Session.open(log, session_id, model, tools, approver=approver)
+        session = Session.open(log, session_id, model, tools, **options)
     return session
 
 
