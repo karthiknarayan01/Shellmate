@@ -20,28 +20,33 @@ This document explains the runtime from the outside in: what runs where, how one
 
 ## 1. What runs where
 
-Everything happens in **one OS process with one thread**. There is no server, no background worker and no async event loop: the agent loop is ordinary blocking Python. While the model is generating a reply, the thread is blocked on an HTTPS request; while a tool runs, the thread is inside the tool's function.
+Everything happens in **one OS process**, on **one asyncio event loop**. There is no server and no background worker. The loop works like a `select`/`epoll` loop: each piece of work is a coroutine that runs until it has to wait (for the model's HTTPS reply, for a tool, for a line of input), and while it waits, other coroutines run. That is what lets the tool calls of one reply run at the same time (§5.1).
 
 ```
 Fig. 1  One running agent-runtime
 
  ┌──────────────────────── process: python (agent-runtime) ─────────────────────────┐
- │  one thread                                                                      │
+ │  event loop thread                                                               │
  │                                                                                  │
- │   CLI prompt loop ──► Session.run_turn() ──► model client ──┐                    │
- │        ▲                    │                               │ HTTPS (blocking)   │
- │        │                    ├──► ToolRegistry.execute() ──┐ │                    │
- │        │                    │                             │ │                    │
- │   in memory:                ▼                             │ │                    │
- │     SessionState     EventLog.append()                    │ │                    │
- │     (messages, tool         │ INSERT + COMMIT + fsync     │ │                    │
- │      call status)           │                             │ │                    │
- └─────────────────────────────┼─────────────────────────────┼─┼────────────────────┘
-                               ▼                             ▼ ▼
-                       agent.db (SQLite, WAL)       workspace     api.anthropic.com
-                       sessions, events,            directory     or api.deepseek.com
-                       schema_migrations            (files)
+ │   CLI prompt loop ──► Session.run_turn() ──► await model.complete() ──┐          │
+ │        ▲                    │                                         │ HTTPS    │
+ │        │                    ├──► await tools.execute()  ×N, at once   │          │
+ │        │                    │         │ async tool: on the loop       │          │
+ │   in memory:                ▼         │ plain function: worker thread │          │
+ │     SessionState     EventLog.append()│                               │          │
+ │     (messages, tool         │ INSERT + COMMIT + fsync                 │          │
+ │      call status)           │         │                               │          │
+ │                                                                                  │
+ │  worker threads (asyncio.to_thread): run plain-function tools                    │
+ │  input thread: reads terminal lines, one per prompt                              │
+ └─────────────────────────────┼─────────┼───────────────────────────────┼──────────┘
+                               ▼         ▼                               ▼
+                       agent.db (SQLite, WAL)   workspace        api.anthropic.com
+                       sessions, events,        directory        or api.deepseek.com
+                       schema_migrations        (files)
 ```
+
+Events are only ever written from the event loop thread, so the database has a single writer even while several tools run.
 
 There are two kinds of state:
 
@@ -144,7 +149,7 @@ Each handler checks that its event is legal in the current state before changing
 
 ## 5. One turn, step by step
 
-`session.py: Session.run_turn` → `_continue_turn` → `_step` (repeated) → `_resolve_open_calls` → `_resolve` for each call.
+`session.py: Session.run_turn` → `_continue_turn` → `_step` (repeated) → `_resolve_open_calls` → `_prepare` for each call, then `_run_all`.
 
 ```
 Fig. 4  A turn: "read config.py and fix the typo"
@@ -157,10 +162,9 @@ Fig. 4  A turn: "read config.py and fix the typo"
    │      │ model.complete(system, messages, tools) ──HTTPS──► provider
    │      │ reply truncated?  → record turn_stopped, raise ReplyTruncated
    │      │ record assistant_message {tool_calls: [read_file(config.py)]}
-   │      │ for each call:
-   │      │     check() → read_file is safe → record tool_started
-   │      │                                   execute()
-   │      │                                   record tool_finished {output}
+   │      │ phase 1, each call in order: check() → read_file is safe, no approval needed
+   │      │ phase 2, all calls at once:  record tool_started → await execute()
+   │      │                              → record tool_finished {output}
    │      ▼
    │   any calls?  yes ─┐
    └────────────────────┘                     second step: write_file(config.py, …)
@@ -200,18 +204,41 @@ A turn also ends when:
 
 A model API failure (after the client's retries) raises `ModelError` and records nothing, so the turn stays open and `resume()` retries the step.
 
+### 5.1 Several tool calls in one reply
+
+A model often asks for several tools at once ("read these three files"). `_resolve_open_calls` handles them in two phases:
+
+```
+Fig. 5  One reply with three calls: search(a), search(b), write_file(c)
+
+ phase 1, one call at a time, in call order          phase 2, all cleared calls at once
+ ─────────────────────────────────────────          ──────────────────────────────────
+ search(a)     check ok, no approval      → run      ┌ tool_started a ── 0.8s ── tool_finished a
+ search(b)     check ok, no approval      → run      ├ tool_started b ── 0.7s ── tool_finished b
+ write_file(c) check ok, approval_requested,         └ tool_started c ─ 0.01s ─ tool_finished c
+               you answer "y", approval_decided → run
+                                                     time ≈ the slowest call, not the sum
+```
+
+- **Approvals come first, one by one**, because a person answers them one by one. Nothing runs until every call in the reply has been cleared or answered.
+- **Then every cleared call runs concurrently**, at most `max_parallel_tools` (default 8) at a time, so a model asking for 50 searches can't flood an API. Each call's `tool_started` is written right before it starts and its `tool_finished` as soon as it ends, so the log always shows exactly which calls were running. Results therefore reach the log in the order the calls finish.
+- **`async def` tools are awaited on the loop; plain functions run in a worker thread** (`asyncio.to_thread`), so a tool that blocks on disk or network doesn't stop the others.
+- **If one call is interrupted** (the turn is cancelled, or a crash in the process), the others are cancelled too. A thread can't be stopped from outside, so a plain-function tool that was mid-run finishes in the background; the log marks it interrupted, which is the same rule as after a crash (§7).
+
+The speed-up is for tools that wait: network requests, subprocesses, slow disks. The model request itself is still one call at a time, and local file tools take milliseconds either way.
+
 ## 6. Approvals
 
-A tool declares `requires_approval=True` if running it changes something (`write_file` does). For such a call, `_resolve` records `approval_requested`, gets a `Decision`, records `approval_decided`, and only then records `tool_started`. Replay rejects a `tool_started` for a call that is awaiting approval, so a log in which a denied or unanswered call ran cannot exist.
+A tool declares `requires_approval=True` if running it changes something (`write_file` does). For such a call, `_prepare` records `approval_requested`, awaits a `Decision`, records `approval_decided`, and only if it's approved does `_run_all` record `tool_started`. Replay rejects a `tool_started` for a call that is awaiting approval, so a log in which a denied or unanswered call ran cannot exist.
 
 | decision | effect |
 |---|---|
 | `approve` | run this call |
 | `approve_for_session` | run it, and add the tool to `state.approved_tools`: later calls of that tool are approved without asking (`source: session`) |
 | `deny` with feedback | don't run it; the model gets "The user denied this tool call. Their feedback: …" and the turn continues |
-| `deny` without feedback | don't run it; skip the rest of the reply; the turn stops |
+| `deny` without feedback | don't run it; skip every other call of the reply, **including calls approved a moment earlier** (nothing has run yet, §5.1); the turn stops |
 
-The decision comes from an `Approver` (`ask(call) -> Decision`). The CLI's `TerminalApprover` prompts you; `AutoApprove` (`--yes`) approves everything; a session created without an approver uses `DenyAll`, so it can never run a risky tool by accident.
+The decision comes from an `Approver` (`async ask(call) -> Decision`). The CLI's `TerminalApprover` prompts you; `AutoApprove` (`--yes`) approves everything; a session created without an approver uses `DenyAll`, so it can never run a risky tool by accident.
 
 Session-wide approvals live in the log, not in the approver, so they survive a restart.
 
@@ -223,7 +250,7 @@ Session-wide approvals live in the log, not in the approver, so they survive a r
 
 ### 7.2 Resuming
 
-`Session.resume` gives every open call a result, starting from the status it reached, then continues the turn with the next model step. It uses the same `_resolve` as a normal step.
+`Session.resume` gives every open call a result, starting from the status it reached, then continues the turn with the next model step. It uses the same `_prepare` and `_run_all` as a normal step, so calls that were cleared run concurrently here too.
 
 | status after replay | what happened before the crash | resume |
 |---|---|---|
@@ -288,7 +315,7 @@ With the defaults, compaction starts at about 102,400 tokens and keeps about 32,
 - at least one message is kept and at least one summarized.
 
 ```
-Fig. 5  Cutting a history of 9 messages
+Fig. 6  Cutting a history of 9 messages
 
  index   0      1         2      3         4      5         6      7         8
  role    user   asst      tool   asst      tool   asst      tool   asst      tool
@@ -319,11 +346,11 @@ The result is one `compaction` event: `{replaced_count, summary}`. Replay applie
 
 ## 9. Model clients
 
-A `ModelClient` has one method: `complete(system, messages, tools) -> ModelReply`, where a reply holds `text`, `reasoning`, `tool_calls`, `usage` and `truncated`. The adapters translate in both directions.
+A `ModelClient` has one coroutine method: `async complete(system, messages, tools) -> ModelReply`, where a reply holds `text`, `reasoning`, `tool_calls`, `usage` and `truncated`. The adapters translate in both directions.
 
 | | Anthropic (`anthropic_model.py`) | DeepSeek (`deepseek_model.py`) |
 |---|---|---|
-| API | Messages API (`anthropic` SDK) | Chat Completions format (`openai` SDK, `https://api.deepseek.com`) |
+| API | Messages API (`anthropic` SDK, async client) | Chat Completions format (`openai` SDK, async client, `https://api.deepseek.com`) |
 | tool results | all results for one reply in one user message, as `tool_result` blocks with `is_error` | one `role: tool` message each; errors prefixed `ERROR:` (no error flag in this format) |
 | reasoning | not used | `reasoning_content` is stored and **always sent back**: DeepSeek rejects a request with tools if earlier assistant messages lack it |
 | cut off at the cap | `stop_reason == "max_tokens"` | `finish_reason == "length"` |
@@ -334,10 +361,10 @@ Both clients rely on their SDK for retries (up to 3 retries with exponential bac
 
 ## 10. Tools
 
-A `Tool` is a name, a description, a JSON schema for its arguments, a Python function, and two flags: `requires_approval` and `idempotent`. `ToolRegistry` runs a call in two parts, so approval can happen in between:
+A `Tool` is a name, a description, a JSON schema for its arguments, a Python function (`async def`, or a plain function that will run in a worker thread), and two flags: `requires_approval` and `idempotent`. `ToolRegistry` runs a call in two parts, so approval can happen in between:
 
 - `check(call)`: unknown tool, arguments that weren't valid JSON, or arguments failing the schema → an error result. A failed check is recorded as `tool_skipped`; nothing is asked or run.
-- `execute(call)`: run the function. An exception inside it becomes an error result.
+- `await execute(call)`: run the function. An exception inside it becomes an error result.
 
 Neither raises. The model sees the error and can correct itself, and the turn goes on.
 
@@ -348,6 +375,8 @@ To give an agent other tools, build a `ToolRegistry` from your own `Tool`s and p
 ## 11. The command-line chat
 
 `cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, `run_turn`, print the answer. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
+
+Two details come from running on an event loop. Terminal input is read by one background thread, one line per prompt, and handed to the loop through a queue: a prompt abandoned with Ctrl+C leaves its read outstanding, and that read answers the next prompt instead of a second reader swallowing a line. Ctrl+C is installed as a signal handler that cancels whatever task is running (the turn, or the wait at a prompt), so it never stops the loop itself; a cancelled turn is then ended with `Session.cancel()`.
 
 ## 12. Tests
 
@@ -360,6 +389,7 @@ The tests that check the central guarantees:
 | an appended event survives SIGKILL; concurrent writers never share a seq | `test_events_durability.py` |
 | killing the process inside a tool, during approval, or during a model call, then resuming, leaves the side effect done exactly once | `test_crash_resume.py` (real SIGKILL of a child process) |
 | a denied tool never runs | `test_session_approvals.py` |
+| calls from one reply run at the same time, approvals first, at most `max_parallel_tools` | `test_session_parallel_tools.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |
 
@@ -367,6 +397,5 @@ The tests that check the central guarantees:
 
 - **One process per session.** Nothing stops two processes from opening the same session at once; they would interleave events. Run one at a time.
 - **No streaming.** Replies arrive whole, which also caps Anthropic requests at 21,333 output tokens.
-- **Tools run one after another**, in the order the model listed them.
 - **Token estimates are rough** (four characters per token) for messages the provider hasn't counted yet. The trigger leaves 20% headroom for that.
 - **The context window default is conservative.** Set `AGENT_CONTEXT_WINDOW` to your model's real window so it doesn't compact earlier than needed.

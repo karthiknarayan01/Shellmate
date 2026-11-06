@@ -32,20 +32,20 @@ class Decision:
 
 
 class Approver(Protocol):
-    def ask(self, call: ToolCall) -> Decision:
-        """Decide one call. May block, e.g. while waiting for a person to answer."""
+    async def ask(self, call: ToolCall) -> Decision:
+        """Decide one call. May wait a long time, e.g. for a person to answer."""
         ...
 
 
 class AutoApprove:
     """Approves everything. For trusted, unattended runs only."""
 
-    def ask(self, call: ToolCall) -> Decision:
+    async def ask(self, call: ToolCall) -> Decision:
         return Decision("approve")
 
 
 class DenyAll:
     """Denies everything. The default, so a session with no approver never runs a risky tool."""
 
-    def ask(self, call: ToolCall) -> Decision:
+    async def ask(self, call: ToolCall) -> Decision:
         return Decision("deny")

@@ -1,11 +1,13 @@
 """The command-line chat, driven with scripted input and a fake model."""
 
+import asyncio
 import io
+import threading
 
 import pytest
 
 from runtime import cli
-from runtime.cli import TerminalApprover, main, parse_answer
+from runtime.cli import Terminal, TerminalApprover, main, parse_answer
 from runtime.approval import Decision
 from runtime.events import EventLog
 from runtime.messages import ToolCall
@@ -146,11 +148,43 @@ def test_answers_map_to_decisions(answer, decision):
     assert parse_answer(answer) == decision
 
 
-def test_approver_prompt_shortens_long_arguments():
+async def test_approver_prompt_shortens_long_arguments():
     out = io.StringIO()
-    approver = TerminalApprover(lambda prompt: "y", out)
-    approver.ask(ToolCall("c1", "write_file", {"path": "a.txt", "content": "x" * 1_000}))
+    approver = TerminalApprover(Terminal(lambda prompt: "y", out), out)
+    decision = await approver.ask(ToolCall("c1", "write_file", {"path": "a.txt", "content": "x" * 1_000}))
+    assert decision == Decision("approve")
     assert "(1000 characters)" in out.getvalue()
+
+
+async def test_a_cancelled_prompt_does_not_swallow_the_next_line():
+    """Ctrl+C at a prompt leaves its read outstanding; that read answers the next prompt."""
+    release = threading.Event()
+    reads = []
+
+    def read(_prompt):
+        reads.append(1)
+        release.wait(timeout=5)
+        return "hello"
+
+    terminal = Terminal(read, io.StringIO())
+    first = asyncio.create_task(terminal.ask("> "))
+    await asyncio.sleep(0.05)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    second = asyncio.create_task(terminal.ask("> "))
+    release.set()
+    assert await second == "hello"
+    assert len(reads) == 1
+
+
+async def test_lines_are_read_only_when_asked_for():
+    reads = []
+    terminal = Terminal(lambda prompt: reads.append(1) or "y", io.StringIO())
+    assert await terminal.ask("> ") == "y"
+    await asyncio.sleep(0.05)
+    assert len(reads) == 1
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
@@ -163,11 +197,11 @@ class FlakyModel(FakeModel):
         super().__init__(replies=replies)
         self.fail_times = fail_times
 
-    def complete(self, system, messages, tools):
+    async def complete(self, system, messages, tools):
         if self.fail_times:
             self.fail_times -= 1
             raise ModelError("Anthropic API error: overloaded")
-        return super().complete(system, messages, tools)
+        return await super().complete(system, messages, tools)
 
 
 def _use_model(monkeypatch, model):

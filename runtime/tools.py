@@ -7,14 +7,20 @@ flags:
                        so after a crash mid-run it is safe to run again
 
 Running a call has two parts, so the session can ask for approval in between:
-    check(call)    is the call well-formed? (known tool, valid JSON, matches the schema)
-    execute(call)  run the function
+    check(call)          is the call well-formed? (known tool, valid JSON, matches the schema)
+    await execute(call)  run the function
 Neither raises for a bad call: problems come back as an error ToolResult, which the model sees
 and can recover from.
+
+A tool function may be `async def`, which is awaited on the event loop, or a plain function,
+which runs in a worker thread (asyncio.to_thread) so it doesn't block the loop while it waits
+on disk or network. Either way several calls can run at the same time.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -29,7 +35,7 @@ class Tool:
     name: str
     description: str
     input_schema: dict[str, Any]
-    fn: Callable[..., str]  # called with the validated arguments as keyword arguments
+    fn: Callable[..., Any]  # called with the validated arguments as keyword arguments
     requires_approval: bool = False
     idempotent: bool = False
 
@@ -55,9 +61,9 @@ class ToolRegistry:
         """What the model is told about the available tools."""
         return [t.spec() for t in self._tools.values()]
 
-    def run(self, call: ToolCall) -> ToolResult:
+    async def run(self, call: ToolCall) -> ToolResult:
         """check() then execute(), for callers that don't need approval in between."""
-        return self.check(call) or self.execute(call)
+        return self.check(call) or await self.execute(call)
 
     def check(self, call: ToolCall) -> ToolResult | None:
         """An error result if the call can't run as given, otherwise None."""
@@ -73,10 +79,15 @@ class ToolRegistry:
             return ToolResult(f"invalid arguments for {call.name}: {e.message}", is_error=True)
         return None
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    async def execute(self, call: ToolCall) -> ToolResult:
         """Run a call that passed check(). An exception inside the tool becomes an error result."""
+        fn = self._tools[call.name].fn
         try:
-            return ToolResult(str(self._tools[call.name].fn(**call.arguments)))
+            if inspect.iscoroutinefunction(fn):
+                output = await fn(**call.arguments)
+            else:
+                output = await asyncio.to_thread(fn, **call.arguments)
+            return ToolResult(str(output))
         except Exception as e:
             return ToolResult(f"{call.name} failed: {type(e).__name__}: {e}", is_error=True)
 

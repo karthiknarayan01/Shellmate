@@ -27,7 +27,7 @@ class AnthropicModel:
         model: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_retries: int = 3,
-        client: anthropic.Anthropic | None = None,
+        client: anthropic.AsyncAnthropic | None = None,
     ):
         """`client` defaults to one reading ANTHROPIC_API_KEY from the environment."""
         if max_tokens > MAX_NON_STREAMING_TOKENS:
@@ -39,12 +39,14 @@ class AnthropicModel:
         self._max_tokens = max_tokens
         if client is None and not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
-        self._client = client or anthropic.Anthropic(max_retries=max_retries)
+        self._client = client or anthropic.AsyncAnthropic(max_retries=max_retries)
 
-    def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
+    async def complete(
+        self, system: str, messages: list[Message], tools: list[ToolSpec]
+    ) -> ModelReply:
         """Send one request and return the parsed reply. API failures raise ModelError."""
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=system,

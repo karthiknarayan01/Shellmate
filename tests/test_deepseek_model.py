@@ -67,13 +67,13 @@ def test_bad_tool_arguments_become_arguments_error(raw, error):
     assert call.arguments == {} and error in call.arguments_error
 
 
-def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
+async def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
     sent = []
-    client = NS(chat=NS(completions=NS(create=lambda **kw: sent.append(kw) or _response(content="ok"))))
+    client = NS(chat=NS(completions=NS(create=_async(lambda **kw: sent.append(kw) or _response(content="ok")))))
     model = DeepSeekModel(model="m", client=client)
 
-    model.complete("s", [Message("user", "hi")], [])
-    model.complete("s", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
+    await model.complete("s", [Message("user", "hi")], [])
+    await model.complete("s", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
 
     assert "tools" not in sent[0]
     assert sent[1]["tools"] == [
@@ -83,13 +83,13 @@ def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
     assert sent[1]["max_tokens"] == DEFAULT_MAX_TOKENS
 
 
-def test_api_failures_become_model_errors():
-    def create(**kwargs):
+async def test_api_failures_become_model_errors():
+    async def create(**kwargs):
         raise openai.APIConnectionError(request=None)
 
     model = DeepSeekModel(client=NS(chat=NS(completions=NS(create=create))))
     with pytest.raises(ModelError, match="DeepSeek API error"):
-        model.complete("s", [Message("user", "hi")], [])
+        await model.complete("s", [Message("user", "hi")], [])
 
 
 def test_default_client_targets_deepseek(monkeypatch):
@@ -104,7 +104,7 @@ def test_missing_api_key_fails_clearly(monkeypatch):
 
 
 @pytest.mark.skipif(not os.environ.get("DEEPSEEK_API_KEY"), reason="needs DEEPSEEK_API_KEY")
-def test_smoke_full_tool_round_trip():
+async def test_smoke_full_tool_round_trip():
     """Two requests: the second carries the first reply's reasoning, which DeepSeek requires."""
     model = DeepSeekModel()
     tool = ToolSpec(
@@ -112,14 +112,14 @@ def test_smoke_full_tool_round_trip():
         {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
     )
     history = [Message("user", "What's the weather in Paris? Use the tool.")]
-    first = model.complete("Use tools when they help.", history, [tool])
+    first = await model.complete("Use tools when they help.", history, [tool])
     assert first.tool_calls
 
     history += [
         Message("assistant", first.text, reasoning=first.reasoning, tool_calls=first.tool_calls),
         Message("tool", "18°C, sunny", tool_call_id=first.tool_calls[0].id),
     ]
-    second = model.complete("Use tools when they help.", history, [tool])
+    second = await model.complete("Use tools when they help.", history, [tool])
     assert "18" in second.text
 
 
@@ -136,3 +136,10 @@ def _response(content=None, tool_calls=None, finish_reason="stop", **extra):
 
 def _api_call(call_id, name, arguments):
     return NS(id=call_id, function=NS(name=name, arguments=arguments))
+
+
+def _async(fn):
+    """Wrap a plain function as the coroutine function the async SDK clients expose."""
+    async def wrapper(**kwargs):
+        return fn(**kwargs)
+    return wrapper
