@@ -110,7 +110,7 @@ class LongTaskModel(FakeModel):
         self.tool_steps = 0
         self.task_requests: list[Request] = []
 
-    async def complete(self, system, messages, tools):
+    async def complete(self, system, messages, tools, on_delta=None):
         request = Request(system, list(messages), list(tools))
         self.requests.append(request)
         if system == SUMMARY_SYSTEM_PROMPT:

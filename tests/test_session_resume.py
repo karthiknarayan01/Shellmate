@@ -199,11 +199,11 @@ CRASH = object()  # put in a CrashingModel script to crash on that model call
 class CrashingModel(FakeModel):
     """FakeModel that raises Crash when it reaches a CRASH entry in its script."""
 
-    async def complete(self, system, messages, tools):
+    async def complete(self, system, messages, tools, on_delta=None):
         if self.replies and self.replies[0] is CRASH:
             self.replies.pop(0)
             raise Crash()
-        return await super().complete(system, messages, tools)
+        return await super().complete(system, messages, tools, on_delta)
 
 
 class Effects:

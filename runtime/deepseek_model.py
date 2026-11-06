@@ -8,7 +8,12 @@ Two things DeepSeek needs that the Anthropic adapter doesn't:
   isn't a JSON object becomes `arguments_error` on the ToolCall, and the model gets an error
   result for that call instead of the runtime crashing.
 
-Retries on 429, 5xx and connection errors are done by the SDK (`max_retries` attempts).
+Replies are streamed. Each chunk carries a delta: a piece of text, a piece of reasoning, or a
+piece of a tool call (its id and name come first, then the JSON arguments in fragments).
+StreamAssembler puts the pieces back together into one ModelReply.
+
+Retries on 429, 5xx and connection errors are done by the SDK (`max_retries` attempts) while
+the stream is being opened; a stream that breaks after it started raises ModelError.
 """
 
 from __future__ import annotations
@@ -20,7 +25,15 @@ from typing import Any
 import openai
 
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ModelReply, ToolSpec, Usage
+from runtime.model import (
+    DEFAULT_MAX_TOKENS,
+    DeltaSink,
+    ModelError,
+    ModelReply,
+    StreamDelta,
+    ToolSpec,
+    Usage,
+)
 
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -42,13 +55,20 @@ class DeepSeekModel:
         )
 
     async def complete(
-        self, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        on_delta: DeltaSink | None = None,
     ) -> ModelReply:
-        """Send one request and return the parsed reply. API failures raise ModelError."""
+        """Stream one reply, passing text and reasoning to `on_delta` as they arrive; return the
+        whole reply. API failures, including a stream that breaks halfway, raise ModelError."""
         request: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
             "messages": to_api_messages(system, messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},  # token counts arrive in the last chunk
         }
         if tools:
             request["tools"] = [
@@ -62,11 +82,13 @@ class DeepSeekModel:
                 }
                 for t in tools
             ]
+        assembler = StreamAssembler(on_delta)
         try:
-            response = await self._client.chat.completions.create(**request)
+            async for chunk in await self._client.chat.completions.create(**request):
+                assembler.add(chunk)
         except openai.APIError as e:
             raise ModelError(f"DeepSeek API error: {e}") from e
-        return from_api_response(response)
+        return assembler.reply()
 
 
 def _require_api_key() -> str:
@@ -110,28 +132,68 @@ def _assistant_message(m: Message) -> dict[str, Any]:
     return message
 
 
-def from_api_response(response: Any) -> ModelReply:
-    """Chat Completions response -> ModelReply. finish_reason "length" means it hit the output cap."""
-    choice = response.choices[0]
-    message = choice.message
-    calls = tuple(_parse_tool_call(c) for c in (message.tool_calls or []))
-    usage = response.usage
-    return ModelReply(
-        text=message.content or "",
-        reasoning=getattr(message, "reasoning_content", None) or "",
-        tool_calls=calls,
-        usage=Usage(usage.prompt_tokens, usage.completion_tokens) if usage else Usage(),
-        truncated=choice.finish_reason == "length",
-    )
+class StreamAssembler:
+    """Collects a streamed reply's chunks into one ModelReply, reporting text as it arrives."""
+
+    def __init__(self, on_delta: DeltaSink | None = None):
+        self._on_delta = on_delta
+        self._text: list[str] = []
+        self._reasoning: list[str] = []
+        self._calls: dict[int, dict[str, Any]] = {}  # by index: id, name, argument fragments
+        self._finish_reason: str | None = None
+        self._usage = Usage()
+
+    def add(self, chunk: Any) -> None:
+        """Fold in one chunk. The last chunk has no choices, only usage."""
+        if getattr(chunk, "usage", None):
+            self._usage = Usage(chunk.usage.prompt_tokens, chunk.usage.completion_tokens)
+        for choice in chunk.choices:
+            delta = choice.delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                self._reasoning.append(reasoning)
+                self._emit("reasoning", reasoning)
+            if delta.content:
+                self._text.append(delta.content)
+                self._emit("text", delta.content)
+            for piece in delta.tool_calls or []:
+                call = self._calls.setdefault(piece.index, {"id": "", "name": "", "arguments": []})
+                if piece.id:
+                    call["id"] = piece.id
+                if piece.function is not None:
+                    if piece.function.name:
+                        call["name"] = piece.function.name
+                    if piece.function.arguments:
+                        call["arguments"].append(piece.function.arguments)
+            if choice.finish_reason:
+                self._finish_reason = choice.finish_reason
+
+    def reply(self) -> ModelReply:
+        """The complete reply. finish_reason "length" means it stopped at the output cap."""
+        calls = tuple(
+            _parse_tool_call(c["id"], c["name"], "".join(c["arguments"]))
+            for _, c in sorted(self._calls.items())
+        )
+        return ModelReply(
+            text="".join(self._text),
+            reasoning="".join(self._reasoning),
+            tool_calls=calls,
+            usage=self._usage,
+            truncated=self._finish_reason == "length",
+        )
+
+    def _emit(self, kind: str, text: str) -> None:
+        if self._on_delta is not None:
+            self._on_delta(StreamDelta(kind, text))
 
 
-def _parse_tool_call(api_call: Any) -> ToolCall:
+def _parse_tool_call(call_id: str, name: str, raw: str) -> ToolCall:
     """Decode the JSON argument string; anything that isn't a JSON object is an arguments_error."""
-    raw = api_call.function.arguments or "{}"
+    raw = raw or "{}"
     try:
         arguments = json.loads(raw)
     except json.JSONDecodeError as e:
-        return ToolCall(api_call.id, api_call.function.name, {}, f"not valid JSON ({e.msg}): {raw!r}")
+        return ToolCall(call_id, name, {}, f"not valid JSON ({e.msg}): {raw!r}")
     if not isinstance(arguments, dict):
-        return ToolCall(api_call.id, api_call.function.name, {}, f"not a JSON object: {raw!r}")
-    return ToolCall(api_call.id, api_call.function.name, arguments)
+        return ToolCall(call_id, name, {}, f"not a JSON object: {raw!r}")
+    return ToolCall(call_id, name, arguments)

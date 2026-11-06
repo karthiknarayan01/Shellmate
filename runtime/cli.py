@@ -19,8 +19,8 @@ The session id is printed so it can be resumed later.
 The chat runs on one asyncio event loop. For each message it starts two tasks:
 
     turn task     session.run_turn(text): the agent loop
-    display task  follows session.subscribe() and prints each event worth showing
-                  (tool runs, errors, skips, compactions, the model's text)
+    display task  follows session.subscribe() and prints the model's text as it is generated,
+                  then each event worth showing (tool runs, errors, skips, compactions)
 
 The final answer is simply the last event the display prints; then control returns to the
 prompt. Terminal input is read by a single background thread (see Terminal), and Ctrl+C
@@ -42,7 +42,7 @@ from runtime.approval import Approver, AutoApprove, Decision
 from runtime.events import Event, EventLog
 from runtime.messages import ToolCall
 from runtime.migrate import migrate
-from runtime.model import ModelError
+from runtime.model import ModelError, StreamDelta
 from runtime.providers import PROVIDERS, make_model
 from runtime.session import (
     CompactionFailed,
@@ -174,11 +174,41 @@ async def run_and_show(
 
 
 async def show_events(events: EventStream, session: Session, out: TextIO) -> None:
-    """The display task: print each event worth showing, until the stream is closed."""
-    async for event in events:
-        line = describe(event, session)
+    """The display task: print what's worth showing, until the stream is closed.
+
+    Streamed text is printed piece by piece on one "assistant>" line. When the complete reply
+    (its assistant_message event) arrives, that line is ended instead of printing the text
+    again. A reply that wasn't streamed is printed whole from its event. While a model thinks
+    before answering, "(thinking...)" is shown once.
+    """
+    streaming = False  # in the middle of an "assistant>" line
+    thinking_shown = False
+    async for item in events:
+        if isinstance(item, StreamDelta):
+            if item.kind == "reasoning":
+                if not thinking_shown and not streaming:
+                    print("  (thinking...)", file=out, flush=True)
+                    thinking_shown = True
+                continue
+            if not streaming:
+                print("\nassistant> ", end="", file=out)
+                streaming = True
+            print(item.text, end="", file=out, flush=True)
+            continue
+        if item.type == "assistant_message":
+            thinking_shown = False
+            if streaming:
+                print(file=out)
+                streaming = False
+                continue
+        line = describe(item, session)
         if line is not None:
+            if streaming:  # a reply cut off mid-stream, then something else
+                print(file=out)
+                streaming = False
             print(line, file=out)
+    if streaming:
+        print(file=out)
 
 
 def describe(event: Event, session: Session) -> str | None:

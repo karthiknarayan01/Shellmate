@@ -28,7 +28,7 @@ Fig. 1  One running agent-runtime
  ┌──────────────────────── process: python (agent-runtime) ─────────────────────────┐
  │  event loop thread                                                               │
  │                                                                                  │
- │   CLI prompt loop ──► Session.run_turn() ──► await model.complete() ──┐          │
+ │   CLI prompt loop ──► Session.run_turn() ──► await model.complete() ──┐ stream   │
  │        ▲                    │                                         │ HTTPS    │
  │        │                    ├──► await tools.execute()  ×N, at once   │          │
  │        │                    │         │ async tool: on the loop       │          │
@@ -238,8 +238,9 @@ Fig. 6  Two tasks on the event loop during one turn
 
  turn task                                         display task
  ─────────                                         ────────────
- session.run_turn("…")                             async for event in session.subscribe():
-   _record(assistant_message "Let me look")  ──►       print "assistant> Let me look"
+ session.run_turn("…")                             async for item in session.subscribe():
+   model streams "Let me" " look"            ──►       print "assistant> Let me", then " look"
+   _record(assistant_message "Let me look")  ──►       (already shown: end the line)
    _record(tool_started read_file)           ──►       print "  -> read_file(path=a.py)"
    await tools.execute()       (waiting…)              (nothing to print)
    _record(tool_finished)                    ──►       (a success: nothing to print)
@@ -247,7 +248,9 @@ Fig. 6  Two tasks on the event loop during one turn
  returns TurnResult                                stream closed → loop ends
 ```
 
-`subscriptions.py: EventHub.publish` puts the event on every subscriber's own queue and returns at once, so a slow UI can't slow the turn, and the session doesn't know who is listening. An event is published after it is in the log and in `SessionState`, so a subscriber that looks at the state sees it up to date. A subscriber only receives events recorded after it subscribed; to show history, replay the log.
+A subscriber receives two kinds of item, in the order they happen: `Event`s, which are already in the log, and `StreamDelta`s, the pieces of a model reply while it is being generated. Deltas are never written to the log: the log records the complete reply once, as `assistant_message`, which always arrives after its deltas. If the process dies mid-stream, the partial text is simply gone and the step is made again on resume. The summary request of a compaction is not streamed to subscribers.
+
+`subscriptions.py: EventHub.publish` puts the item on every subscriber's own queue and returns at once, so a slow UI can't slow the turn, and the session doesn't know who is listening. An event is published after it is in the log and in `SessionState`, so a subscriber that looks at the state sees it up to date. A subscriber only receives events recorded after it subscribed; to show history, replay the log.
 
 A subscriber can wait until it has handled everything published so far (`EventStream.drained()`). The CLI's approval prompt uses this so that it appears after the progress lines that led to it, not before them.
 
@@ -370,18 +373,21 @@ The result is one `compaction` event: `{replaced_count, summary}`. Replay applie
 
 ## 9. Model clients
 
-A `ModelClient` has one coroutine method: `async complete(system, messages, tools) -> ModelReply`, where a reply holds `text`, `reasoning`, `tool_calls`, `usage` and `truncated`. The adapters translate in both directions.
+A `ModelClient` has one coroutine method: `async complete(system, messages, tools, on_delta=None) -> ModelReply`, where a reply holds `text`, `reasoning`, `tool_calls`, `usage` and `truncated`. The adapters translate in both directions.
 
 | | Anthropic (`anthropic_model.py`) | DeepSeek (`deepseek_model.py`) |
 |---|---|---|
 | API | Messages API (`anthropic` SDK, async client) | Chat Completions format (`openai` SDK, async client, `https://api.deepseek.com`) |
 | tool results | all results for one reply in one user message, as `tool_result` blocks with `is_error` | one `role: tool` message each; errors prefixed `ERROR:` (no error flag in this format) |
 | reasoning | not used | `reasoning_content` is stored and **always sent back**: DeepSeek rejects a request with tools if earlier assistant messages lack it |
+| streaming | `messages.stream()`; text from `text_stream`, reply from `get_final_message()` | `stream=True`; chunks assembled by `StreamAssembler` |
 | cut off at the cap | `stop_reason == "max_tokens"` | `finish_reason == "length"` |
 | tool arguments | already a JSON object | a JSON string; one that isn't a valid object becomes `ToolCall.arguments_error`, answered with an error result |
 | default model | `claude-sonnet-5-5` | `deepseek-v4-pro` |
 
-Both clients rely on their SDK for retries (up to 3 retries with exponential backoff on 429, 5xx and connection errors) and raise `ModelError` once those are used up. The output cap is `AGENT_MAX_OUTPUT_TOKENS` (default 16,000). Only generated tokens are billed, so the cap only bounds the worst case. Anthropic caps above 21,333 are rejected at startup, because the SDK refuses larger requests that don't stream.
+Both clients **stream** every reply. While it is being generated, they call `on_delta` with each piece of text (and, for DeepSeek, of reasoning) as a `StreamDelta`; when the stream ends they return the complete `ModelReply`, exactly as before. Anthropic's SDK assembles the final message itself (`stream.get_final_message()`), which is parsed like a non-streamed response. For DeepSeek, `StreamAssembler` rebuilds the reply from the chunks: text and reasoning are concatenated, and each tool call is put back together from its pieces, keyed by index (the id and name come first, then the JSON arguments in fragments). Token usage arrives in the last chunk (`stream_options.include_usage`).
+
+Both clients rely on their SDK for retries (up to 3 retries with exponential backoff on 429, 5xx and connection errors) while the stream is being opened. A stream that breaks after it started is not retried: it raises `ModelError`, nothing has been recorded, and `/resume` makes the step again. The output cap is `AGENT_MAX_OUTPUT_TOKENS` (default 16,000). Only generated tokens are billed, so the cap only bounds the worst case. Because requests stream, the cap can go as high as the model allows.
 
 ## 10. Tools
 
@@ -398,7 +404,7 @@ To give an agent other tools, build a `ToolRegistry` from your own `Tool`s and p
 
 ## 11. The command-line chat
 
-`cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, run the turn. Each turn runs as one task while a display task follows `session.subscribe()` and prints what `describe(event)` says is worth showing: the model's text (including what it says before calling tools), each tool call as it starts, tool errors, skipped calls and compactions. The final answer is just the last of those lines; then control returns to the prompt. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
+`cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, run the turn. Each turn runs as one task while a display task follows `session.subscribe()` and prints what's worth showing: the model's text as it is generated (including what it says before calling tools; when its `assistant_message` arrives the line is just ended, not printed again), "(thinking...)" once while a model reasons before answering, and, from `describe(event)`, each tool call as it starts, tool errors, skipped calls and compactions. The final answer is just the last of those lines; then control returns to the prompt. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
 
 Two details come from running on an event loop. Terminal input is read by one background thread, one line per prompt, and handed to the loop through a queue: a prompt abandoned with Ctrl+C leaves its read outstanding, and that read answers the next prompt instead of a second reader swallowing a line. Ctrl+C is installed as a signal handler that cancels whatever task is running (the turn, or the wait at a prompt), so it never stops the loop itself; a cancelled turn is then ended with `Session.cancel()`.
 
@@ -415,13 +421,13 @@ The tests that check the central guarantees:
 | a denied tool never runs | `test_session_approvals.py` |
 | calls from one reply run at the same time, approvals first, at most `max_parallel_tools` | `test_session_parallel_tools.py` |
 | a subscriber sees each event while the turn is still running; one that never reads doesn't block it | `test_subscriptions.py` |
+| a reply's text is streamed before its event and never logged; streamed chunks rebuild the same reply | `test_subscriptions.py`, `test_deepseek_model.py`, `test_anthropic_model.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |
 
 ## 13. Limits
 
 - **One process per session.** Nothing stops two processes from opening the same session at once; they would interleave events. Run one at a time.
-- **No token streaming.** Events reach subscribers as they happen, but each model reply arrives whole, so its text appears all at once. That also caps Anthropic requests at 21,333 output tokens.
 - **Subscriber queues are unbounded.** A subscriber that stops reading keeps every event in memory until it is closed.
 - **Token estimates are rough** (four characters per token) for messages the provider hasn't counted yet. The trigger leaves 20% headroom for that.
 - **The context window default is conservative.** Set `AGENT_CONTEXT_WINDOW` to your model's real window so it doesn't compact earlier than needed.

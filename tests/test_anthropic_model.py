@@ -1,5 +1,5 @@
-"""AnthropicModel: message conversion both ways, and the request it sends. No network involved,
-except the smoke test, which runs only when ANTHROPIC_API_KEY is set."""
+"""AnthropicModel: message conversion both ways, streaming, and the request it sends. No network
+involved, except the smoke test, which runs only when ANTHROPIC_API_KEY is set."""
 
 import os
 from types import SimpleNamespace as NS
@@ -9,7 +9,7 @@ import pytest
 
 from runtime.anthropic_model import AnthropicModel, from_api_response, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, StreamDelta, ToolSpec, Usage
 
 
 def test_user_and_assistant_messages():
@@ -64,12 +64,29 @@ def test_hitting_the_output_cap_marks_the_reply_truncated():
     assert from_api_response(response).truncated is True
 
 
-async def test_default_output_cap_is_sent(monkeypatch):
-    sent = {}
-    client = NS(messages=NS(create=_async(lambda **kw: sent.update(kw) or NS(
-        content=[], usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn"))))
+async def test_reply_is_streamed_and_the_final_message_parsed():
+    final = NS(content=[NS(type="text", text="Hello there")],
+               usage=NS(input_tokens=5, output_tokens=2), stop_reason="end_turn")
+    client = FakeStreamingClient(texts=["Hel", "lo there"], final=final)
+    deltas = []
+
+    reply = await AnthropicModel(client=client).complete("s", [Message("user", "hi")], [],
+                                                         on_delta=deltas.append)
+
+    assert deltas == [StreamDelta("text", "Hel"), StreamDelta("text", "lo there")]
+    assert reply.text == "Hello there" and reply.usage == Usage(5, 2)
+
+
+async def test_default_output_cap_is_sent():
+    client = FakeStreamingClient()
     await AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
-    assert sent["max_tokens"] == DEFAULT_MAX_TOKENS
+    assert client.sent["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+async def test_output_cap_above_the_old_non_streaming_limit_is_allowed():
+    client = FakeStreamingClient()
+    await AnthropicModel(max_tokens=64_000, client=client).complete("s", [Message("user", "hi")], [])
+    assert client.sent["max_tokens"] == 64_000
 
 
 def test_missing_api_key_fails_clearly(monkeypatch):
@@ -78,27 +95,18 @@ def test_missing_api_key_fails_clearly(monkeypatch):
         AnthropicModel()
 
 
-async def test_api_failures_become_model_errors():
-    async def create(**kwargs):
-        raise anthropic.APIConnectionError(request=None)
-
-    model = AnthropicModel(client=NS(messages=NS(create=create)))
+async def test_a_stream_that_breaks_halfway_is_a_model_error():
+    client = FakeStreamingClient(texts=["Hel"], fail_after_texts=True)
     with pytest.raises(ModelError, match="Anthropic API error"):
-        await model.complete("s", [Message("user", "hi")], [])
+        await AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
 
 
 async def test_request_carries_model_system_and_tools():
-    sent = {}
-
-    async def create(**kwargs):
-        sent.update(kwargs)
-        return NS(content=[NS(type="text", text="ok")],
-                  usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")
-
-    client = NS(messages=NS(create=create))
+    client = FakeStreamingClient()
     model = AnthropicModel(model="m", max_tokens=99, client=client)
     await model.complete("be brief", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
 
+    sent = client.sent
     assert sent["model"] == "m" and sent["max_tokens"] == 99 and sent["system"] == "be brief"
     assert sent["tools"] == [{"name": "t", "description": "does t", "input_schema": {"type": "object"}}]
 
@@ -115,8 +123,39 @@ async def test_smoke_real_api_calls_a_tool():
     assert reply.tool_calls and reply.tool_calls[0].name == "get_weather"
 
 
-def _async(fn):
-    """Wrap a plain function as the coroutine function the async SDK clients expose."""
-    async def wrapper(**kwargs):
-        return fn(**kwargs)
-    return wrapper
+class FakeStreamingClient:
+    """Stands in for AsyncAnthropic: `messages.stream(**request)` yields `texts`, then the final
+    message. With fail_after_texts, the stream breaks after the texts, like a dropped connection."""
+
+    def __init__(self, texts=(), final=None, fail_after_texts=False):
+        self.texts = list(texts)
+        self.final = final or NS(content=[NS(type="text", text="".join(texts))],
+                                 usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")
+        self.fail_after_texts = fail_after_texts
+        self.sent = {}
+        self.messages = NS(stream=self._stream)
+
+    def _stream(self, **request):
+        self.sent = request
+        client = self
+
+        class Stream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            @property
+            def text_stream(self):
+                async def texts():
+                    for text in client.texts:
+                        yield text
+                    if client.fail_after_texts:
+                        raise anthropic.APIConnectionError(request=None)
+                return texts()
+
+            async def get_final_message(self):
+                return client.final
+
+        return Stream()

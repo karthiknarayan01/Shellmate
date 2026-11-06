@@ -61,5 +61,5 @@ In the chat:
 |---|---|---|
 | `ANTHROPIC_API_KEY` | | key for `--provider anthropic` |
 | `DEEPSEEK_API_KEY` | | key for `--provider deepseek` |
-| `AGENT_MAX_OUTPUT_TOKENS` | 16000 | output token cap per model request (Anthropic allows at most 21333 without streaming) |
+| `AGENT_MAX_OUTPUT_TOKENS` | 16000 | output token cap per model request |
 | `AGENT_CONTEXT_WINDOW` | 128000 | context window used to decide when to compact; set it to your model's real window |
