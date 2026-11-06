@@ -1,6 +1,6 @@
 # agent-runtime
 
-A small, crash-safe runtime for tool-using AI agents, written from scratch in Python. It runs an agent loop against Anthropic or DeepSeek models and records every step in an append-only SQLite log, so:
+A small, crash-safe runtime for tool-using AI agents, written from scratch in Python. It runs an agent loop against Anthropic or DeepSeek models, or an open model on your own computer, and records every step in an append-only SQLite log, so:
 
 - **a session survives a crash.** Kill the process at any point, start it again, and the interrupted turn finishes from where it stopped, without repeating a tool's side effect.
 - **tools that change things ask first.** You approve, approve for the rest of the session, or deny (with optional feedback for the model). A denied tool never runs.
@@ -8,23 +8,53 @@ A small, crash-safe runtime for tool-using AI agents, written from scratch in Py
 
 It comes with a terminal chat, three workspace tools (`list_files`, `read_file`, `write_file`) confined to one directory, and two web tools (`web_search`, `read_web_page`) for news and anything current. Web search is free and needs no key or account. How it works inside: [docs/architecture.md](docs/architecture.md).
 
-## Setup
+## Quick start
 
-Python 3.11 or newer.
+macOS or Linux, with Python 3.11 or newer.
 
 ```
 git clone https://github.com/karthiknarayan01/agent-runtime
 cd agent-runtime
+./start.sh
+```
+
+The first run installs everything into `.venv` and asks which model to use:
+
+1. **Qwen on your computer**, through [Ollama](https://ollama.com): free, private, no key. The script installs Ollama if it's missing (it asks first), starts it, and downloads the model once: Qwen 3.5 9B (6.6 GB), or the 4B model (3.4 GB) on a machine with less than 12 GB of memory.
+2. **Anthropic Claude**, with your API key.
+3. **DeepSeek**, with your API key.
+
+Then the chat opens. Your choice is saved in `~/.config/agent-runtime/config`, readable only by you, so later runs go straight to the chat. A key already in `ANTHROPIC_API_KEY` or `DEEPSEEK_API_KEY` is used without being saved.
+
+```
+./start.sh                       open the chat (the tools work in the directory you run it from)
+./start.sh --setup               choose the model again
+./start.sh --resume latest       any other options are passed to agent-runtime (see Usage)
+```
+
+To use it from any directory, add an alias: `alias agent="$HOME/path/to/agent-runtime/start.sh"`.
+
+## Manual setup
+
+If you'd rather not use the script:
+
+```
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
+export ANTHROPIC_API_KEY=...      # for --provider anthropic (the default)
+export DEEPSEEK_API_KEY=...       # for --provider deepseek
+agent-runtime
 ```
 
-Set the API key for the provider you'll use:
+For a local model, install [Ollama](https://ollama.com/download), then:
 
 ```
-export ANTHROPIC_API_KEY=...      # Anthropic (default)
-export DEEPSEEK_API_KEY=...       # DeepSeek
+ollama serve                   # not needed if the Ollama app is running
+ollama pull qwen3.5:9b         # once
+agent-runtime --provider ollama
 ```
+
+Any other model you've pulled works with `--model`, for example `qwen3.5:4b` on an 8 GB machine or `qwen3.5:27b` with 32 GB or more. A local model is slower than a hosted one, and it only sees `AGENT_CONTEXT_WINDOW` tokens of the conversation (32,768 by default; a larger window takes more memory).
 
 The database is created and migrated automatically on first run. To migrate it yourself, for example after upgrading:
 
@@ -37,8 +67,9 @@ agent-runtime-migrate agent.db
 ```
 agent-runtime                          new session; the tools work in the current directory
 agent-runtime --provider deepseek      use DeepSeek instead of Anthropic
+agent-runtime --provider ollama        use a local model through Ollama
 agent-runtime --provider deepseek --model deepseek-flash
-                                       pick a model (defaults: claude-sonnet-5-5, deepseek-v4-pro)
+                                       pick a model (defaults: claude-sonnet-5-5, deepseek-v4-pro, qwen3.5:9b)
 agent-runtime --workspace ~/project    let the tools work in another directory
 agent-runtime --resume latest          continue the most recent session
 agent-runtime --resume <session id>    continue a specific session (the id is printed at start)
@@ -69,4 +100,5 @@ In the chat, the agent's work is shown as it happens: a spinner while it waits, 
 | `ANTHROPIC_API_KEY` | | key for `--provider anthropic` |
 | `DEEPSEEK_API_KEY` | | key for `--provider deepseek` |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16000 | output token cap per model request |
-| `AGENT_CONTEXT_WINDOW` | 128000 | context window used to decide when to compact; set it to your model's real window |
+| `AGENT_CONTEXT_WINDOW` | 128000 (32768 for ollama) | context window used to decide when to compact; set it to your model's real window. For ollama it is also the window the model is run with |
+| `OLLAMA_HOST` | `localhost:11434` | where Ollama is listening |

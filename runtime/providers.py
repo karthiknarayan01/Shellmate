@@ -3,6 +3,7 @@
     make_model("anthropic")            ANTHROPIC_API_KEY, default model claude-sonnet-5-5
     make_model("deepseek")             DEEPSEEK_API_KEY, default model deepseek-v4-pro
     make_model("deepseek", "deepseek-flash")
+    make_model("ollama")               local, no key, default model qwen3.5:9b
 
 The output token cap per request comes from AGENT_MAX_OUTPUT_TOKENS when set, otherwise
 DEFAULT_MAX_TOKENS. A `max_tokens` argument overrides both.
@@ -16,10 +17,19 @@ from runtime.anthropic_model import DEFAULT_MODEL as ANTHROPIC_DEFAULT_MODEL
 from runtime.anthropic_model import AnthropicModel
 from runtime.deepseek_model import DEFAULT_MODEL as DEEPSEEK_DEFAULT_MODEL
 from runtime.deepseek_model import DeepSeekModel
+from runtime.compaction import context_window_from_env
 from runtime.model import DEFAULT_MAX_TOKENS, ModelClient
+from runtime.ollama_model import DEFAULT_CONTEXT_WINDOW as OLLAMA_DEFAULT_CONTEXT_WINDOW
+from runtime.ollama_model import DEFAULT_MODEL as OLLAMA_DEFAULT_MODEL
+from runtime.ollama_model import OllamaModel
 
-PROVIDERS = {"anthropic": AnthropicModel, "deepseek": DeepSeekModel}
-DEFAULT_MODELS = {"anthropic": ANTHROPIC_DEFAULT_MODEL, "deepseek": DEEPSEEK_DEFAULT_MODEL}
+PROVIDERS = {"anthropic": AnthropicModel, "deepseek": DeepSeekModel, "ollama": OllamaModel}
+DEFAULT_MODELS = {
+    "anthropic": ANTHROPIC_DEFAULT_MODEL,
+    "deepseek": DEEPSEEK_DEFAULT_MODEL,
+    "ollama": OLLAMA_DEFAULT_MODEL,
+}
+LOCAL_PROVIDERS = {"ollama"}
 MAX_TOKENS_ENV = "AGENT_MAX_OUTPUT_TOKENS"
 
 
@@ -32,9 +42,13 @@ def make_model(
         raise ValueError(f"unknown provider {provider!r}; expected one of {sorted(PROVIDERS)}")
     if max_tokens is None:
         max_tokens = max_tokens_from_env()
+    options: dict = {"max_tokens": max_tokens}
     if model:
-        return cls(model=model, max_tokens=max_tokens)
-    return cls(max_tokens=max_tokens)
+        options["model"] = model
+    if provider == "ollama":
+        # A local model's window is what we ask Ollama to allocate, so it has to be explicit.
+        options["context_window"] = context_window_from_env() or OLLAMA_DEFAULT_CONTEXT_WINDOW
+    return cls(**options)
 
 
 def max_tokens_from_env() -> int:

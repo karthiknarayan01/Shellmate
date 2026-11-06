@@ -42,9 +42,9 @@ Fig. 1  One running agent-runtime
  │  display task (on the loop): follows session.subscribe(), prints progress        │
  └─────────────────────────────┼─────────┼───────────────────────────────┼──────────┘
                                ▼         ▼                               ▼
-                       agent.db (SQLite, WAL)   workspace        api.anthropic.com
-                       sessions, events,        directory        or api.deepseek.com
-                       schema_migrations        (files)
+                       agent.db (SQLite, WAL)   workspace        api.anthropic.com,
+                       sessions, events,        directory        api.deepseek.com, or
+                       schema_migrations        (files)          Ollama on localhost
 ```
 
 Events are only ever written from the event loop thread, so the database has a single writer even while several tools run.
@@ -68,7 +68,7 @@ The rest of this document follows from that split.
 | `runtime/subscriptions.py` | `EventHub`, `EventStream`: follow a session's events live |
 | `runtime/compaction.py` | when and how to summarize old messages |
 | `runtime/model.py` | the `ModelClient` interface and its reply type |
-| `runtime/anthropic_model.py`, `runtime/deepseek_model.py` | the two provider adapters |
+| `runtime/anthropic_model.py`, `runtime/deepseek_model.py`, `runtime/ollama_model.py` | the provider adapters |
 | `runtime/providers.py` | `make_model()`: pick a provider by name |
 | `runtime/tools.py` | `Tool`, `ToolRegistry`: validate and run tool calls |
 | `runtime/workspace_tools.py` | `list_files`, `read_file`, `write_file` |
@@ -77,7 +77,7 @@ The rest of this document follows from that split.
 | `runtime/approval.py` | `Decision`, the `Approver` interface, `AutoApprove`, `DenyAll` |
 | `runtime/cli.py` | the terminal chat and its approval prompt |
 
-Dependencies point one way: `cli → session → (state, compaction, tools, approval, model) → (events, messages)`. Only the two adapter files know a provider's wire format.
+Dependencies point one way: `cli → session → (state, compaction, tools, approval, model) → (events, messages)`. Only the adapter files know a provider's wire format.
 
 ## 3. The event log
 
@@ -377,19 +377,26 @@ The result is one `compaction` event: `{replaced_count, summary}`. Replay applie
 
 A `ModelClient` has one coroutine method: `async complete(system, messages, tools, on_delta=None) -> ModelReply`, where a reply holds `text`, `reasoning`, `tool_calls`, `usage` and `truncated`. The adapters translate in both directions.
 
-| | Anthropic (`anthropic_model.py`) | DeepSeek (`deepseek_model.py`) |
-|---|---|---|
-| API | Messages API (`anthropic` SDK, async client) | Chat Completions format (`openai` SDK, async client, `https://api.deepseek.com`) |
-| tool results | all results for one reply in one user message, as `tool_result` blocks with `is_error` | one `role: tool` message each; errors prefixed `ERROR:` (no error flag in this format) |
-| reasoning | not used | `reasoning_content` is stored and **always sent back**: DeepSeek rejects a request with tools if earlier assistant messages lack it |
-| streaming | `messages.stream()`; text from `text_stream`, reply from `get_final_message()` | `stream=True`; chunks assembled by `StreamAssembler` |
-| cut off at the cap | `stop_reason == "max_tokens"` | `finish_reason == "length"` |
-| tool arguments | already a JSON object | a JSON string; one that isn't a valid object becomes `ToolCall.arguments_error`, answered with an error result |
-| default model | `claude-sonnet-5-5` | `deepseek-v4-pro` |
+| | Anthropic (`anthropic_model.py`) | DeepSeek (`deepseek_model.py`) | Ollama (`ollama_model.py`) |
+|---|---|---|---|
+| API | Messages API (`anthropic` SDK, async client) | Chat Completions format (`openai` SDK, async client, `https://api.deepseek.com`) | native chat API (`ollama` package, async client, `localhost:11434`) |
+| tool results | all results for one reply in one user message, as `tool_result` blocks with `is_error` | one `role: tool` message each; errors prefixed `ERROR:` (no error flag in this format) | one `role: tool` message each, with `tool_name` (Ollama has no call ids); errors prefixed `ERROR:` |
+| reasoning | not used | `reasoning_content` is stored and **always sent back**: DeepSeek rejects a request with tools if earlier assistant messages lack it | Qwen's `thinking` is streamed and stored, not sent back |
+| streaming | `messages.stream()`; text from `text_stream`, reply from `get_final_message()` | `stream=True`; chunks assembled by `StreamAssembler` | `stream=True`; chunks assembled by `ChunkAssembler` |
+| cut off at the cap | `stop_reason == "max_tokens"` | `finish_reason == "length"` | `done_reason == "length"` |
+| tool arguments | already a JSON object | a JSON string; one that isn't a valid object becomes `ToolCall.arguments_error`, answered with an error result | already an object; calls arrive whole, and each gets an id (`call_<hex>`) |
+| default model | `claude-sonnet-5-5` | `deepseek-v4-pro` | `qwen3.5:9b` |
 
-Both clients **stream** every reply. While it is being generated, they call `on_delta` with each piece of text (and, for DeepSeek, of reasoning) as a `StreamDelta`; when the stream ends they return the complete `ModelReply`, exactly as before. Anthropic's SDK assembles the final message itself (`stream.get_final_message()`), which is parsed like a non-streamed response. For DeepSeek, `StreamAssembler` rebuilds the reply from the chunks: text and reasoning are concatenated, and each tool call is put back together from its pieces, keyed by index (the id and name come first, then the JSON arguments in fragments). Token usage arrives in the last chunk (`stream_options.include_usage`).
+All clients **stream** every reply. While it is being generated, they call `on_delta` with each piece of text (and, for DeepSeek and Qwen, of reasoning) as a `StreamDelta`; when the stream ends they return the complete `ModelReply`, exactly as before. Anthropic's SDK assembles the final message itself (`stream.get_final_message()`), which is parsed like a non-streamed response. For DeepSeek, `StreamAssembler` rebuilds the reply from the chunks: text and reasoning are concatenated, and each tool call is put back together from its pieces, keyed by index (the id and name come first, then the JSON arguments in fragments). Token usage arrives in the last chunk (`stream_options.include_usage`).
 
-Both clients rely on their SDK for retries (up to 3 retries with exponential backoff on 429, 5xx and connection errors) while the stream is being opened. A stream that breaks after it started is not retried: it raises `ModelError`, nothing has been recorded, and `/resume` makes the step again. The output cap is `AGENT_MAX_OUTPUT_TOKENS` (default 16,000). Only generated tokens are billed, so the cap only bounds the worst case. Because requests stream, the cap can go as high as the model allows.
+The two hosted clients rely on their SDK for retries (up to 3 retries with exponential backoff on 429, 5xx and connection errors) while the stream is being opened. A stream that breaks after it started is not retried: it raises `ModelError`, nothing has been recorded, and `/resume` makes the step again. The output cap is `AGENT_MAX_OUTPUT_TOKENS` (default 16,000). Only generated tokens are billed, so the cap only bounds the worst case. Because requests stream, the cap can go as high as the model allows.
+
+### 9.1 Local models
+
+`--provider ollama` runs the model on the same computer through [Ollama](https://ollama.com); nothing leaves the machine and there is no key or cost. The default is Qwen 3.5 9B (`qwen3.5:9b`, a 6.6 GB download), which supports tool calling and thinking and fits a 16 GB Mac with room for its context. Two things differ from the hosted providers:
+
+- **The window is chosen, not given.** Ollama allocates only a small context unless asked, and anything beyond it is silently dropped. So every request sets `num_ctx` to the client's `context_window` (32,768 by default, or `AGENT_CONTEXT_WINDOW`), and the CLI hands the same number to compaction. The output cap (`num_predict`) is held to half the window, so a reply can't push its own prompt out.
+- **It is checked at startup.** Before the chat opens, `check()` asks Ollama for the model: if Ollama isn't running, or the model hasn't been pulled, the CLI exits with the command that fixes it rather than failing on the first message. There are no automatic retries; a failed request raises `ModelError` and `/resume` repeats the step.
 
 ## 10. Tools
 
@@ -453,6 +460,10 @@ There is always at most one live region on screen: the spinner, or the answer be
 
 **Ctrl+C.** During a turn it is a signal handler that cancels the turn's task, so it never stops the event loop; the cancelled turn is then ended with `Session.cancel()`. At a prompt it ends the chat.
 
+### 11.1 `start.sh`
+
+The script in the repository root wraps the CLI for people who just want to chat. It keeps a virtual environment in `.venv` (reinstalled when `pyproject.toml` changes, detected with `cksum`) and a saved choice in `~/.config/agent-runtime/config`: `PROVIDER`, `MODEL` and, when typed in, the API key, in a file only the user can read. The file is parsed as `KEY=value` lines, not sourced. With no saved choice, or with `--setup`, it asks for one; for Ollama it then installs Ollama if missing (after asking), starts it (the macOS app, or `ollama serve` in the background with its log in `~/.local/state/agent-runtime/ollama.log`), waits for `/api/version` to answer, and pulls the model if `ollama show` doesn't find it. Every run ends with `exec agent-runtime --provider P --model M "$@"`, so any other option reaches the CLI unchanged and the shell doesn't stay behind it.
+
 ## 12. Tests
 
 `python -m pytest -q` (install with `pip install -e ".[dev]"`). Every test uses a scripted fake model (`tests/fake_model.py`), so the suite needs no API key and no network, except two smoke tests that run only when a real key is set. CI runs it on Python 3.11 and 3.13 for every pull request.
@@ -470,6 +481,7 @@ The tests that check the central guarantees:
 | a reply's text is streamed before its event and never logged; streamed chunks rebuild the same reply | `test_subscriptions.py`, `test_deepseek_model.py`, `test_anthropic_model.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |
+| `start.sh` sets up each provider once, then goes straight to the chat | `test_start_script.py` (fake Ollama and CLI) |
 
 ## 13. Limits
 
