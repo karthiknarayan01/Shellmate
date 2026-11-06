@@ -14,11 +14,16 @@ Role = Literal["user", "assistant", "tool"]
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    """A request from the model to run one tool. `id` is chosen by the model provider."""
+    """A request from the model to run one tool. `id` is chosen by the model provider.
+
+    `arguments_error` is set when the model sent arguments that are not a JSON object;
+    the call is then answered with an error instead of being run.
+    """
 
     id: str
     name: str
     arguments: dict[str, Any]
+    arguments_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,12 +31,14 @@ class Message:
     """One message in the conversation.
 
     user       text
-    assistant  text and/or tool_calls
+    assistant  text and/or tool_calls; `reasoning` holds the model's thinking text when the
+               provider returns it (some providers require it to be sent back)
     tool       the result of one tool call: text, tool_call_id, is_error
     """
 
     role: Role
     text: str = ""
+    reasoning: str = ""
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     tool_call_id: str | None = None
     is_error: bool = False

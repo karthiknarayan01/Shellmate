@@ -44,6 +44,18 @@ def test_full_tool_round_trip():
     assert state.unfinished_calls() == []
 
 
+def test_reasoning_and_argument_errors_survive_replay():
+    call = {"id": "c1", "name": "t", "arguments": {}, "arguments_error": "not valid JSON"}
+    state = project(
+        _events(
+            ("user_message", {"text": "go"}),
+            ("assistant_message", {"text": "", "reasoning": "hmm", "tool_calls": [call]}),
+        )
+    )
+    assert state.messages[1].reasoning == "hmm"
+    assert state.messages[1].tool_calls[0].arguments_error == "not valid JSON"
+
+
 def test_tool_error_result_is_marked():
     state = project(
         _tool_turn(("tool_started", {"call_id": "c1"}),
