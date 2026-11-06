@@ -4,6 +4,7 @@ One turn = the user's message, then model steps until the model replies without 
 
     record user_message
     repeat (at most max_steps):
+        next request near the context window?  -> compact (see compaction.py)
         reply = model(system, messages, tools)
         cut off at the output token cap?  -> record turn_stopped, raise ReplyTruncated
         record assistant_message
@@ -34,8 +35,17 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from runtime.approval import Approver, Decision, DenyAll
+from runtime.compaction import (
+    SUMMARY_SYSTEM_PROMPT,
+    CompactionPolicy,
+    choose_cut,
+    estimate_tokens,
+    policy_from_env,
+    render_transcript,
+    summary_message_text,
+)
 from runtime.events import EventLog
-from runtime.messages import ToolCall
+from runtime.messages import Message, ToolCall
 from runtime.model import ModelClient
 from runtime.state import SessionState, ToolCallState, ToolCallStatus, apply, project
 from runtime.tools import ToolRegistry
@@ -71,6 +81,10 @@ class TurnInProgress(RuntimeError):
     """A turn was interrupted by a crash and hasn't been resumed yet."""
 
 
+class CompactionFailed(RuntimeError):
+    """The summary request was cut off at the output token cap."""
+
+
 class Session:
     def __init__(
         self,
@@ -82,10 +96,12 @@ class Session:
         approver: Approver | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 20,
+        compaction: CompactionPolicy | None = None,
     ):
         """Use Session.create() or Session.open() rather than calling this directly.
 
-        Without an approver, every tool that requires approval is denied.
+        Without an approver, every tool that requires approval is denied. Without a compaction
+        policy, the context window comes from AGENT_CONTEXT_WINDOW or the default.
         """
         self.log = log
         self.session_id = session_id
@@ -95,6 +111,7 @@ class Session:
         self.approver = approver or DenyAll()
         self.system_prompt = system_prompt
         self.max_steps = max_steps
+        self.compaction = compaction or policy_from_env()
 
     @classmethod
     def create(cls, log: EventLog, model: ModelClient, tools: ToolRegistry, **options: Any) -> Session:
@@ -147,6 +164,7 @@ class Session:
         A truncated reply is not recorded: its last tool call may have incomplete arguments,
         and its text may be cut mid-sentence. The turn is stopped instead.
         """
+        self._compact_if_needed()
         reply = self.model.complete(self.system_prompt, self.state.messages, self.tools.specs())
         if reply.truncated:
             self._record("turn_stopped", {"reason": "truncated"})
@@ -168,6 +186,31 @@ class Session:
         if denied is not None:
             return self._stop_after_denial(denied)
         return None
+
+    def _compact_if_needed(self) -> None:
+        """Summarize the oldest messages if the next request would pass the trigger.
+
+        The summary request runs before anything is recorded, so a crash during it leaves the
+        log unchanged and the next attempt simply compacts again.
+        """
+        specs = self.tools.specs()
+        if estimate_tokens(self.state, self.system_prompt, specs) < self.compaction.trigger_tokens:
+            return
+        cut = choose_cut(self.state.messages, self.compaction.keep_tokens)
+        if cut is None:
+            return
+        transcript = render_transcript(self.state.messages[:cut])
+        reply = self.model.complete(SUMMARY_SYSTEM_PROMPT, [Message("user", transcript)], [])
+        if reply.truncated:
+            raise CompactionFailed("the summary hit the output token cap")
+        self._record(
+            "compaction",
+            {
+                "replaced_count": cut,
+                "summary": summary_message_text(reply.text, self.state.turn_request),
+                "usage": asdict(reply.usage),
+            },
+        )
 
     def _resolve_open_calls(self) -> ToolCall | None:
         """Give every open call a result, in call order.
