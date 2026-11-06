@@ -121,7 +121,7 @@ agent-runtime                          # new session; the tools work in the curr
 agent-runtime --provider deepseek      # use DeepSeek instead of Anthropic
 agent-runtime --provider ollama        # use a local model through Ollama
 agent-runtime --provider deepseek --model deepseek-flash
-                                       # pick a model (default: the provider's best, see below)
+                                       # pick a model (defaults below)
 agent-runtime --workspace ~/project    # let the tools work in another directory
 agent-runtime --resume latest          # continue the most recent session
 agent-runtime --resume <session id>    # continue a specific session (the id is printed at start)
