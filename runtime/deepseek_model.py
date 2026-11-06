@@ -20,7 +20,7 @@ from typing import Any
 import openai
 
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ModelReply, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ModelReply, ToolSpec, Usage
 
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -42,7 +42,7 @@ class DeepSeekModel:
         )
 
     def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
-        """Send one request and return the parsed reply."""
+        """Send one request and return the parsed reply. API failures raise ModelError."""
         request: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
@@ -60,7 +60,11 @@ class DeepSeekModel:
                 }
                 for t in tools
             ]
-        return from_api_response(self._client.chat.completions.create(**request))
+        try:
+            response = self._client.chat.completions.create(**request)
+        except openai.APIError as e:
+            raise ModelError(f"DeepSeek API error: {e}") from e
+        return from_api_response(response)
 
 
 def _require_api_key() -> str:

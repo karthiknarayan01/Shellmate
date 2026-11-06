@@ -44,6 +44,10 @@ class ModelReply:
     truncated: bool = False
 
 
+class ModelError(RuntimeError):
+    """The provider's API failed after the client's retries (auth, quota, outage, bad request)."""
+
+
 class ModelClient(Protocol):
     def complete(
         self, system: str, messages: list[Message], tools: list[ToolSpec]

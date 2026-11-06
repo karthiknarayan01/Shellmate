@@ -4,11 +4,12 @@ No network, except the smoke test, which runs only when DEEPSEEK_API_KEY is set.
 import os
 from types import SimpleNamespace as NS
 
+import openai
 import pytest
 
 from runtime.deepseek_model import BASE_URL, DeepSeekModel, from_api_response, to_api_messages
 from runtime.messages import Message, ToolCall
-from runtime.model import DEFAULT_MAX_TOKENS, ToolSpec, Usage
+from runtime.model import DEFAULT_MAX_TOKENS, ModelError, ToolSpec, Usage
 
 THINKING_CALL = Message(
     "assistant", "", reasoning="I should read it.",
@@ -80,6 +81,15 @@ def test_request_omits_tools_when_there_are_none_and_includes_them_otherwise():
     ]
     assert sent[1]["model"] == "m"
     assert sent[1]["max_tokens"] == DEFAULT_MAX_TOKENS
+
+
+def test_api_failures_become_model_errors():
+    def create(**kwargs):
+        raise openai.APIConnectionError(request=None)
+
+    model = DeepSeekModel(client=NS(chat=NS(completions=NS(create=create))))
+    with pytest.raises(ModelError, match="DeepSeek API error"):
+        model.complete("s", [Message("user", "hi")], [])
 
 
 def test_default_client_targets_deepseek(monkeypatch):

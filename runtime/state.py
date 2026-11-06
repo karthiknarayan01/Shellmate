@@ -24,7 +24,7 @@ A tool call's status moves through these transitions, one event each:
     requested --approval_requested--> awaiting_approval --approval_decided(approve)--> approved
     requested | approved --tool_started--> started --tool_finished--> finished
     awaiting_approval --approval_decided(deny)--> finished   (never started)
-    requested --tool_skipped--> finished                     (never started)
+    requested | awaiting_approval | approved --tool_skipped--> finished   (never started)
 
 Because each step is its own event, a crash leaves the call in the status it had reached:
 `awaiting_approval` (nobody answered yet) or `started` (the tool may or may not have run).
@@ -197,8 +197,13 @@ def _on_tool_finished(state: SessionState, event: Event) -> None:
 
 
 def _on_tool_skipped(state: SessionState, event: Event) -> None:
-    """REQUESTED -> FINISHED without running, with the reason as an error result."""
-    tool = _require_call(state, event, expected={ToolCallStatus.REQUESTED})
+    """REQUESTED, AWAITING_APPROVAL or APPROVED -> FINISHED without running, with the reason as
+    an error result. A started call can't be skipped: it may already have had its effect."""
+    tool = _require_call(
+        state,
+        event,
+        expected={ToolCallStatus.REQUESTED, ToolCallStatus.AWAITING_APPROVAL, ToolCallStatus.APPROVED},
+    )
     _finish(state, tool, event.payload["reason"], is_error=True)
 
 

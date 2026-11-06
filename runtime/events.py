@@ -115,11 +115,12 @@ class EventLog:
             "WHERE session_id = ? AND seq > ? ORDER BY seq",
             (session_id, after_seq),
         ).fetchall()
-        if not rows and not self._session_exists(session_id):
+        if not rows and not self.has_session(session_id):
             raise UnknownSession(session_id)
         return [Event(session_id, seq, t, json.loads(p), ts) for seq, t, p, ts in rows]
 
-    def _session_exists(self, session_id: str) -> bool:
+    def has_session(self, session_id: str) -> bool:
+        """True if `new_session` created this id."""
         row = self._conn.execute(
             "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
