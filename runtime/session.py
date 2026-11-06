@@ -9,7 +9,9 @@ One turn = the user's message, then model steps until the model replies without 
         cut off at the output token cap?  -> record turn_stopped, raise ReplyTruncated
         record assistant_message
         no tool calls?  -> the turn is over, return the reply text
-        resolve each tool call, in order (see _resolve)
+        resolve the tool calls (see _resolve_open_calls):
+            1. in call order: validate each call, ask for approval where needed
+            2. run every call that may run, at the same time (at most max_parallel_tools)
     step limit reached  -> record turn_stopped, raise MaxStepsReached
 
 Every change goes through `_record()`, which appends the event to the log first and then
@@ -27,12 +29,17 @@ last completed step, and `Session.open()` + `resume()` carry the turn on from th
 
 A started, non-idempotent tool is never run a second time, because the log can't tell whether
 its side effect happened before the crash.
+
+Everything runs on one asyncio event loop in one thread. Model requests and tool calls are
+awaited, so while they wait on the network or a worker thread, other tool calls make progress.
+Events are only ever written from the loop, so the log still has a single writer.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from runtime.approval import Approver, Decision, DenyAll
 from runtime.compaction import (
@@ -54,6 +61,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. Use the tools to look things up instead of guessing. "
     "When you have the answer, reply without calling a tool."
 )
+
+DEFAULT_MAX_PARALLEL_TOOLS = 8
 
 INTERRUPTED_RESULT = (
     "Interrupted: the process stopped while this tool was running, so it may or may not have "
@@ -96,6 +105,7 @@ class Session:
         approver: Approver | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = 20,
+        max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
         compaction: CompactionPolicy | None = None,
         observer: Callable[[Event], None] | None = None,
     ):
@@ -113,6 +123,7 @@ class Session:
         self.approver = approver or DenyAll()
         self.system_prompt = system_prompt
         self.max_steps = max_steps
+        self.max_parallel_tools = max_parallel_tools
         self.compaction = compaction or policy_from_env()
         self.observer = observer
 
@@ -136,21 +147,21 @@ class Session:
         """True when the last turn was interrupted and never ended."""
         return self.state.turn_open
 
-    def run_turn(self, user_text: str) -> TurnResult:
+    async def run_turn(self, user_text: str) -> TurnResult:
         """Run one turn: until the model answers without tools, or the user stops it."""
         if self.state.turn_open:
             raise TurnInProgress("the previous turn was interrupted; call resume() first")
         self._record("user_message", {"text": user_text})
-        return self._continue_turn()
+        return await self._continue_turn()
 
-    def resume(self) -> TurnResult | None:
+    async def resume(self) -> TurnResult | None:
         """Finish a turn interrupted by a crash. Returns None if there was nothing to resume."""
         if not self.state.turn_open:
             return None
-        denied = self._resolve_open_calls()
+        denied = await self._resolve_open_calls()
         if denied is not None:
             return self._stop_after_denial(denied)
-        return self._continue_turn()
+        return await self._continue_turn()
 
     def cancel(self) -> None:
         """End an interrupted turn without running anything more (the user pressed Ctrl+C).
@@ -160,30 +171,26 @@ class Session:
         """
         if not self.state.turn_open:
             return
-        for tool in self.state.unfinished_calls():
-            if tool.status is ToolCallStatus.STARTED:
-                self._finish(tool.call, INTERRUPTED_RESULT, is_error=True, interrupted=True)
-            else:
-                self._record("tool_skipped", {"call_id": tool.call.id, "reason": "cancelled by the user"})
+        self._abandon_open_calls(reason="cancelled by the user")
         self._record("turn_stopped", {"reason": "cancelled"})
 
-    def _continue_turn(self) -> TurnResult:
+    async def _continue_turn(self) -> TurnResult:
         """Model steps until a final answer, a denial that stops the turn, or the step limit."""
         for _ in range(self.max_steps):
-            result = self._step()
+            result = await self._step()
             if result is not None:
                 return result
         self._record("turn_stopped", {"reason": "max_steps"})
         raise MaxStepsReached(f"no final answer after {self.max_steps} steps")
 
-    def _step(self) -> TurnResult | None:
-        """One model call, then its tool calls in order. Returns None if the turn continues.
+    async def _step(self) -> TurnResult | None:
+        """One model call, then its tool calls. Returns None if the turn continues.
 
         A truncated reply is not recorded: its last tool call may have incomplete arguments,
         and its text may be cut mid-sentence. The turn is stopped instead.
         """
-        self._compact_if_needed()
-        reply = self.model.complete(self.system_prompt, self.state.messages, self.tools.specs())
+        await self._compact_if_needed()
+        reply = await self.model.complete(self.system_prompt, self.state.messages, self.tools.specs())
         if reply.truncated:
             self._record("turn_stopped", {"reason": "truncated"})
             raise ReplyTruncated(
@@ -200,12 +207,12 @@ class Session:
         )
         if not reply.tool_calls:
             return TurnResult(reply.text)
-        denied = self._resolve_open_calls()
+        denied = await self._resolve_open_calls()
         if denied is not None:
             return self._stop_after_denial(denied)
         return None
 
-    def _compact_if_needed(self) -> None:
+    async def _compact_if_needed(self) -> None:
         """Summarize the oldest messages if the next request would pass the trigger.
 
         The summary request runs before anything is recorded, so a crash during it leaves the
@@ -218,7 +225,7 @@ class Session:
         if cut is None:
             return
         transcript = render_transcript(self.state.messages[:cut])
-        reply = self.model.complete(SUMMARY_SYSTEM_PROMPT, [Message("user", transcript)], [])
+        reply = await self.model.complete(SUMMARY_SYSTEM_PROMPT, [Message("user", transcript)], [])
         if reply.truncated:
             raise CompactionFailed("the summary hit the output token cap")
         self._record(
@@ -230,55 +237,79 @@ class Session:
             },
         )
 
-    def _resolve_open_calls(self) -> ToolCall | None:
-        """Give every open call a result, in call order.
+    async def _resolve_open_calls(self) -> ToolCall | None:
+        """Give every open call a result.
 
-        Returns the call whose denial (without feedback) stopped the turn, after skipping the
-        calls that came after it; otherwise None.
+        Phase 1, one call at a time in call order: validate it and, if it needs approval, ask.
+        Approvals are asked one by one because a person answers them one by one.
+        Phase 2: run every call that phase 1 cleared, all at the same time.
+
+        A denial without feedback stops the turn before anything runs: every call still open,
+        including ones approved a moment earlier, is skipped. Returns that denied call, or None.
         """
+        to_run: list[tuple[ToolCall, bool]] = []  # (call, is a re-run after a crash)
         for tool in self.state.unfinished_calls():
-            decision = self._resolve(tool)
-            if decision is not None and not decision.approved and not decision.feedback:
-                self._skip_open_calls(reason=f"skipped: the user denied {tool.call.name}")
+            action = await self._prepare(tool)
+            if action == "stop":
+                self._abandon_open_calls(reason=f"skipped: the user denied {tool.call.name}")
                 return tool.call
+            if action in ("run", "rerun"):
+                to_run.append((tool.call, action == "rerun"))
+        await self._run_all(to_run)
         return None
 
-    def _resolve(self, tool: ToolCallState) -> Decision | None:
-        """Move one call to FINISHED from whatever status it is in.
+    async def _prepare(self, tool: ToolCallState) -> Literal["run", "rerun", "done", "stop"]:
+        """Decide what happens to one open call, from whatever status it is in.
 
-        Returns the approval decision, if one was made.
+        run    it may run now          done  it already has its result (invalid, denied with
+        rerun  idempotent, re-run it         feedback, or interrupted)
+        stop   denied without feedback: the turn ends
         """
         call = tool.call
         if tool.status is ToolCallStatus.STARTED:
-            self._recover_started(call)
-            return None
+            if self.tools.is_idempotent(call.name):
+                return "rerun"
+            self._finish(call, INTERRUPTED_RESULT, is_error=True, interrupted=True)
+            return "done"
         if tool.status is ToolCallStatus.REQUESTED:
             error = self.tools.check(call)
             if error is not None:
                 self._record("tool_skipped", {"call_id": call.id, "reason": error.output})
-                return None
+                return "done"
             if not self.tools.requires_approval(call.name):
-                self._run(call)
-                return None
+                return "run"
             self._record("approval_requested", {"call_id": call.id})
-        decision = None
         if tool.status is ToolCallStatus.AWAITING_APPROVAL:
-            decision = self._decide(call)
+            decision = await self._decide(call)
             if not decision.approved:
-                return decision
-        self._run(call)  # status is APPROVED here
-        return decision
+                return "done" if decision.feedback else "stop"
+        return "run"  # status is APPROVED here
 
-    def _recover_started(self, call: ToolCall) -> None:
-        """A call that was running when the process died: re-run it only if that's safe."""
-        if self.tools.is_idempotent(call.name):
-            self._record("tool_restarted", {"call_id": call.id})
-            result = self.tools.execute(call)
-            self._finish(call, result.output, result.is_error)
-        else:
-            self._finish(call, INTERRUPTED_RESULT, is_error=True, interrupted=True)
+    async def _run_all(self, calls: list[tuple[ToolCall, bool]]) -> None:
+        """Run the calls concurrently, at most max_parallel_tools at a time.
 
-    def _decide(self, call: ToolCall) -> Decision:
+        Each call's tool_started (or tool_restarted) is written right before it starts, and its
+        tool_finished as soon as it ends, so the log always shows which calls were running.
+        If one call is interrupted (cancelled, or a crash in the process), the others are
+        cancelled too and the exception propagates.
+        """
+        limit = asyncio.Semaphore(self.max_parallel_tools)
+
+        async def run_one(call: ToolCall, rerun: bool) -> None:
+            async with limit:
+                self._record("tool_restarted" if rerun else "tool_started", {"call_id": call.id})
+                result = await self.tools.execute(call)
+                self._finish(call, result.output, result.is_error)
+
+        tasks = [asyncio.create_task(run_one(call, rerun)) for call, rerun in calls]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+
+    async def _decide(self, call: ToolCall) -> Decision:
         """Get and record a decision for a call awaiting approval.
 
         A tool approved for the session is approved without asking. Otherwise the approver is
@@ -287,7 +318,7 @@ class Session:
         if call.name in self.state.approved_tools:
             decision, source = Decision("approve"), "session"
         else:
-            decision, source = self.approver.ask(call), "approver"
+            decision, source = await self.approver.ask(call), "approver"
         self._record(
             "approval_decided",
             {
@@ -299,22 +330,23 @@ class Session:
         )
         return decision
 
-    def _run(self, call: ToolCall) -> None:
-        """Record tool_started, run the tool, record tool_finished."""
-        self._record("tool_started", {"call_id": call.id})
-        result = self.tools.execute(call)
-        self._finish(call, result.output, result.is_error)
-
     def _finish(self, call: ToolCall, output: str, is_error: bool, interrupted: bool = False) -> None:
         payload = {"call_id": call.id, "output": output, "is_error": is_error}
         if interrupted:
             payload["interrupted"] = True
         self._record("tool_finished", payload)
 
-    def _skip_open_calls(self, reason: str) -> None:
-        """Give every call still open an error result without running it."""
+    def _abandon_open_calls(self, reason: str) -> None:
+        """Give every call still open a result without running anything.
+
+        A call that had started gets the interrupted result, since it may have had its effect;
+        the others are skipped with `reason`.
+        """
         for tool in self.state.unfinished_calls():
-            self._record("tool_skipped", {"call_id": tool.call.id, "reason": reason})
+            if tool.status is ToolCallStatus.STARTED:
+                self._finish(tool.call, INTERRUPTED_RESULT, is_error=True, interrupted=True)
+            else:
+                self._record("tool_skipped", {"call_id": tool.call.id, "reason": reason})
 
     def _stop_after_denial(self, denied: ToolCall) -> TurnResult:
         self._record("turn_stopped", {"reason": "denied"})

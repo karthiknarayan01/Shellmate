@@ -20,7 +20,7 @@ class FakeModel:
     replies: list[ModelReply]
     requests: list[Request] = field(default_factory=list)
 
-    def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
+    async def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
         self.requests.append(Request(system, list(messages), list(tools)))
         if not self.replies:
             raise AssertionError("FakeModel ran out of scripted replies")

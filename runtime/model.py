@@ -49,6 +49,6 @@ class ModelError(RuntimeError):
 
 
 class ModelClient(Protocol):
-    def complete(
+    async def complete(
         self, system: str, messages: list[Message], tools: list[ToolSpec]
     ) -> ModelReply: ...

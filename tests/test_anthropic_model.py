@@ -64,11 +64,11 @@ def test_hitting_the_output_cap_marks_the_reply_truncated():
     assert from_api_response(response).truncated is True
 
 
-def test_default_output_cap_is_sent(monkeypatch):
+async def test_default_output_cap_is_sent(monkeypatch):
     sent = {}
-    client = NS(messages=NS(create=lambda **kw: sent.update(kw) or NS(
-        content=[], usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")))
-    AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
+    client = NS(messages=NS(create=_async(lambda **kw: sent.update(kw) or NS(
+        content=[], usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn"))))
+    await AnthropicModel(client=client).complete("s", [Message("user", "hi")], [])
     assert sent["max_tokens"] == DEFAULT_MAX_TOKENS
 
 
@@ -78,38 +78,45 @@ def test_missing_api_key_fails_clearly(monkeypatch):
         AnthropicModel()
 
 
-def test_api_failures_become_model_errors():
-    def create(**kwargs):
+async def test_api_failures_become_model_errors():
+    async def create(**kwargs):
         raise anthropic.APIConnectionError(request=None)
 
     model = AnthropicModel(client=NS(messages=NS(create=create)))
     with pytest.raises(ModelError, match="Anthropic API error"):
-        model.complete("s", [Message("user", "hi")], [])
+        await model.complete("s", [Message("user", "hi")], [])
 
 
-def test_request_carries_model_system_and_tools():
+async def test_request_carries_model_system_and_tools():
     sent = {}
 
-    def create(**kwargs):
+    async def create(**kwargs):
         sent.update(kwargs)
         return NS(content=[NS(type="text", text="ok")],
                   usage=NS(input_tokens=1, output_tokens=1), stop_reason="end_turn")
 
     client = NS(messages=NS(create=create))
     model = AnthropicModel(model="m", max_tokens=99, client=client)
-    model.complete("be brief", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
+    await model.complete("be brief", [Message("user", "hi")], [ToolSpec("t", "does t", {"type": "object"})])
 
     assert sent["model"] == "m" and sent["max_tokens"] == 99 and sent["system"] == "be brief"
     assert sent["tools"] == [{"name": "t", "description": "does t", "input_schema": {"type": "object"}}]
 
 
 @pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="needs ANTHROPIC_API_KEY")
-def test_smoke_real_api_calls_a_tool():
+async def test_smoke_real_api_calls_a_tool():
     tool = ToolSpec(
         "get_weather", "Weather for a city.",
         {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
     )
-    reply = AnthropicModel().complete(
+    reply = await AnthropicModel().complete(
         "Always use the tool.", [Message("user", "What's the weather in Paris?")], [tool]
     )
     assert reply.tool_calls and reply.tool_calls[0].name == "get_weather"
+
+
+def _async(fn):
+    """Wrap a plain function as the coroutine function the async SDK clients expose."""
+    async def wrapper(**kwargs):
+        return fn(**kwargs)
+    return wrapper

@@ -25,8 +25,8 @@ def test_specs_describe_every_tool(registry):
     ]
 
 
-def test_valid_call_returns_the_output_as_text(registry):
-    assert registry.run(ToolCall("c", "add", {"a": 2, "b": 3})) == ToolResult("5")
+async def test_valid_call_returns_the_output_as_text(registry):
+    assert await registry.run(ToolCall("c", "add", {"a": 2, "b": 3})) == ToolResult("5")
 
 
 @pytest.mark.parametrize(
@@ -40,13 +40,13 @@ def test_valid_call_returns_the_output_as_text(registry):
     ],
     ids=["unknown", "missing-arg", "wrong-type", "extra-arg", "tool-raises"],
 )
-def test_failures_are_error_results_not_exceptions(registry, call, message):
-    result = registry.run(call)
+async def test_failures_are_error_results_not_exceptions(registry, call, message):
+    result = await registry.run(call)
     assert result.is_error and message in result.output
 
 
-def test_arguments_the_model_could_not_encode_are_an_error_result(registry):
-    result = registry.run(ToolCall("c", "add", {}, arguments_error="not valid JSON: '{\"a\": '"))
+async def test_arguments_the_model_could_not_encode_are_an_error_result(registry):
+    result = await registry.run(ToolCall("c", "add", {}, arguments_error="not valid JSON: '{\"a\": '"))
     assert result.is_error and "not valid JSON" in result.output
 
 

@@ -32,16 +32,18 @@ class DeepSeekModel:
         model: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_retries: int = 3,
-        client: openai.OpenAI | None = None,
+        client: openai.AsyncOpenAI | None = None,
     ):
         """`client` defaults to one for DeepSeek's endpoint, keyed by DEEPSEEK_API_KEY."""
         self._model = model
         self._max_tokens = max_tokens
-        self._client = client or openai.OpenAI(
+        self._client = client or openai.AsyncOpenAI(
             base_url=BASE_URL, api_key=_require_api_key(), max_retries=max_retries
         )
 
-    def complete(self, system: str, messages: list[Message], tools: list[ToolSpec]) -> ModelReply:
+    async def complete(
+        self, system: str, messages: list[Message], tools: list[ToolSpec]
+    ) -> ModelReply:
         """Send one request and return the parsed reply. API failures raise ModelError."""
         request: dict[str, Any] = {
             "model": self._model,
@@ -61,7 +63,7 @@ class DeepSeekModel:
                 for t in tools
             ]
         try:
-            response = self._client.chat.completions.create(**request)
+            response = await self._client.chat.completions.create(**request)
         except openai.APIError as e:
             raise ModelError(f"DeepSeek API error: {e}") from e
         return from_api_response(response)

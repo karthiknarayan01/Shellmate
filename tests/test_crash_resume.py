@@ -8,6 +8,7 @@ side effect is appending a line to that file, which is not idempotent: running i
 leave two lines.
 """
 
+import asyncio
 import multiprocessing as mp
 import os
 import signal
@@ -19,7 +20,7 @@ from runtime.tools import Tool, ToolRegistry
 from tests.fake_model import FakeModel, call, say
 
 
-def test_kill_inside_a_tool_after_its_side_effect(db, tmp_path):
+async def test_kill_inside_a_tool_after_its_side_effect(db, tmp_path):
     effects = tmp_path / "effects.txt"
     sid = _run_child_until_killed(_child_dies_inside_tool, db, effects)
     assert _lines(effects) == ["hello"]
@@ -27,14 +28,14 @@ def test_kill_inside_a_tool_after_its_side_effect(db, tmp_path):
     model = FakeModel([say("I can't confirm it was sent")])
     with EventLog(db) as log:
         session = Session.open(log, sid, model, _tools(effects))
-        result = session.resume()
+        result = await session.resume()
 
     assert _lines(effects) == ["hello"]  # not appended twice
     assert result.text == "I can't confirm it was sent"
     assert model.requests[0].messages[-1].text == INTERRUPTED_RESULT
 
 
-def test_kill_while_waiting_for_approval(db, tmp_path):
+async def test_kill_while_waiting_for_approval(db, tmp_path):
     effects = tmp_path / "effects.txt"
     sid = _run_child_until_killed(_child_dies_in_approver, db, effects)
     assert _lines(effects) == []
@@ -42,19 +43,19 @@ def test_kill_while_waiting_for_approval(db, tmp_path):
     with EventLog(db) as log:
         session = Session.open(log, sid, FakeModel([say("sent")]), _tools(effects),
                                approver=_Approve())
-        assert session.resume().text == "sent"
+        assert (await session.resume()).text == "sent"
 
     assert _lines(effects) == ["hello"]
 
 
-def test_kill_during_the_model_call_after_a_tool_finished(db, tmp_path):
+async def test_kill_during_the_model_call_after_a_tool_finished(db, tmp_path):
     effects = tmp_path / "effects.txt"
     sid = _run_child_until_killed(_child_dies_in_second_model_call, db, effects)
     assert _lines(effects) == ["hello"]
 
     with EventLog(db) as log:
         session = Session.open(log, sid, FakeModel([say("sent")]), _tools(effects))
-        assert session.resume().text == "sent"
+        assert (await session.resume()).text == "sent"
 
     assert _lines(effects) == ["hello"]
 
@@ -62,18 +63,23 @@ def test_kill_during_the_model_call_after_a_tool_finished(db, tmp_path):
 # ── running the child ────────────────────────────────────────────────────────────────────
 
 
-def _run_child_until_killed(target, db, effects):
-    """Start a session, run `target` in a child process, check it died by SIGKILL."""
+def _run_child_until_killed(turn, db, effects):
+    """Start a session, run the coroutine function `turn` in a child process, check it died by
+    SIGKILL."""
     with EventLog(db) as log:
         sid = log.new_session()
-    child = mp.get_context("spawn").Process(target=target, args=(db, sid, str(effects)))
+    child = mp.get_context("spawn").Process(target=_child_main, args=(turn, db, sid, str(effects)))
     child.start()
     child.join(timeout=60)
     assert child.exitcode == -signal.SIGKILL
     return sid
 
 
-def _child_dies_inside_tool(db, sid, effects):
+def _child_main(turn, db, sid, effects):
+    asyncio.run(turn(db, sid, effects))
+
+
+async def _child_dies_inside_tool(db, sid, effects):
     def append_then_die(text):
         _append(effects, text)
         _die()
@@ -82,31 +88,31 @@ def _child_dies_inside_tool(db, sid, effects):
     with EventLog(db) as log:
         session = Session.open(log, sid, FakeModel([call("append_line", text="hello")]), tools,
                                approver=AutoApprove())
-        session.run_turn("append hello")
+        await session.run_turn("append hello")
 
 
-def _child_dies_in_approver(db, sid, effects):
+async def _child_dies_in_approver(db, sid, effects):
     class DieApprover:
-        def ask(self, call):
+        async def ask(self, call):
             _die()
 
     with EventLog(db) as log:
         session = Session.open(log, sid, FakeModel([call("append_line", text="hello")]),
                                _tools(effects), approver=DieApprover())
-        session.run_turn("append hello")
+        await session.run_turn("append hello")
 
 
-def _child_dies_in_second_model_call(db, sid, effects):
+async def _child_dies_in_second_model_call(db, sid, effects):
     class DieOnSecondCall(FakeModel):
-        def complete(self, system, messages, tools):
+        async def complete(self, system, messages, tools):
             if self.requests:
                 _die()
-            return super().complete(system, messages, tools)
+            return await super().complete(system, messages, tools)
 
     with EventLog(db) as log:
         session = Session.open(log, sid, DieOnSecondCall([call("append_line", text="hello")]),
                                _tools(effects), approver=AutoApprove())
-        session.run_turn("append hello")
+        await session.run_turn("append hello")
 
 
 # ── tools and helpers (module-level so the spawned child can import them) ────────────────
@@ -142,5 +148,5 @@ def _die():
 
 
 class _Approve:
-    def ask(self, call):
+    async def ask(self, call):
         return Decision("approve")

@@ -28,20 +28,20 @@ def log(db):
         yield log
 
 
-def test_started_non_idempotent_tool_is_not_run_again(log):
+async def test_started_non_idempotent_tool_is_not_run_again(log):
     """The tool's side effect happened, then the process died before tool_finished."""
     effects = Effects(crash_in="send", crash_after_effect=True)
     session = Session.create(log, FakeModel([call("send", text="hi")]), effects.tools(),
                              approver=AutoApprove())
     with pytest.raises(Crash):
-        session.run_turn("send hi")
+        await session.run_turn("send hi")
     assert effects.ran == ["send"]
 
     model = FakeModel([say("I can't tell whether it was sent")])
     resumed = Session.open(log, session.session_id, model, effects.tools())
     assert resumed.needs_resume
 
-    result = resumed.resume()
+    result = await resumed.resume()
     assert effects.ran == ["send"]  # not repeated
     assert result.text == "I can't tell whether it was sent"
     tool_result = model.requests[0].messages[-1]
@@ -50,36 +50,36 @@ def test_started_non_idempotent_tool_is_not_run_again(log):
     assert finished[-1].payload["interrupted"] is True
 
 
-def test_started_idempotent_tool_is_run_again(log):
+async def test_started_idempotent_tool_is_run_again(log):
     effects = Effects(crash_in="read", crash_after_effect=True)
     session = Session.create(log, FakeModel([call("read", path="a")]), effects.tools())
     with pytest.raises(Crash):
-        session.run_turn("read a")
+        await session.run_turn("read a")
 
     resumed = Session.open(log, session.session_id, FakeModel([say("a says hi")]), effects.tools())
-    assert resumed.resume().text == "a says hi"
+    assert (await resumed.resume()).text == "a says hi"
     assert effects.ran == ["read", "read"]
     assert "tool_restarted" in _types(log, session)
     assert resumed.state.messages[-2].text == "contents of a"
 
 
-def test_crash_while_waiting_for_approval_asks_again(log):
+async def test_crash_while_waiting_for_approval_asks_again(log):
     effects = Effects()
     session = Session.create(log, FakeModel([call("send", text="hi")]), effects.tools(),
                              approver=CrashingApprover())
     with pytest.raises(Crash):
-        session.run_turn("send hi")
+        await session.run_turn("send hi")
     assert session.state.tool_calls["c1"].status is ToolCallStatus.AWAITING_APPROVAL
 
     approver = ScriptedApprover([Decision("approve")])
     resumed = Session.open(log, session.session_id, FakeModel([say("sent")]), effects.tools(),
                            approver=approver)
-    assert resumed.resume().text == "sent"
+    assert (await resumed.resume()).text == "sent"
     assert len(approver.asked) == 1 and effects.ran == ["send"]
     assert _types(log, session).count("approval_requested") == 1  # not requested twice
 
 
-def test_approved_but_not_started_call_runs_without_asking_again(log):
+async def test_approved_but_not_started_call_runs_without_asking_again(log):
     sid = log.new_session()
     log.append(sid, "user_message", {"text": "send hi"})
     log.append(sid, "assistant_message",
@@ -91,35 +91,39 @@ def test_approved_but_not_started_call_runs_without_asking_again(log):
     effects = Effects()
     approver = ScriptedApprover([])
     resumed = Session.open(log, sid, FakeModel([say("sent")]), effects.tools(), approver=approver)
-    resumed.resume()
+    await resumed.resume()
     assert effects.ran == ["send"] and approver.asked == []
 
 
-def test_crash_during_the_next_model_call_does_not_rerun_finished_tools(log):
+async def test_crash_during_the_next_model_call_does_not_rerun_finished_tools(log):
     effects = Effects()
     model = CrashingModel([call("send", text="hi"), CRASH])
     session = Session.create(log, model, effects.tools(), approver=ScriptedApprover([Decision("approve")]))
     with pytest.raises(Crash):
-        session.run_turn("send hi")
+        await session.run_turn("send hi")
 
     resumed = Session.open(log, session.session_id, FakeModel([say("sent")]), effects.tools())
-    assert resumed.resume().text == "sent"
+    assert (await resumed.resume()).text == "sent"
     assert effects.ran == ["send"]
 
 
-def test_crash_before_the_first_model_reply_retries_the_model(log):
+async def test_crash_before_the_first_model_reply_retries_the_model(log):
     session = Session.create(log, CrashingModel([CRASH]), ToolRegistry([]))
     with pytest.raises(Crash):
-        session.run_turn("hi")
+        await session.run_turn("hi")
 
     model = FakeModel([say("hello")])
     resumed = Session.open(log, session.session_id, model, ToolRegistry([]))
-    assert resumed.resume().text == "hello"
+    assert (await resumed.resume()).text == "hello"
     assert [m.text for m in model.requests[0].messages] == ["hi"]
 
 
-def test_open_calls_are_resolved_in_order_from_their_own_status(log):
-    """One reply with three calls: the first finished, the second was running, the third untouched."""
+async def test_crash_in_one_of_several_parallel_calls(log):
+    """Three calls run together; the process dies inside `send`, after its effect.
+
+    The two reads may or may not have finished before the crash (they ran at the same time), so
+    on resume each is either kept or, being idempotent, re-run. `send` is never repeated.
+    """
     effects = Effects(crash_in="send", crash_after_effect=True)
     reply = ModelReply(tool_calls=(
         ToolCall("c1", "read", {"path": "a"}),
@@ -129,58 +133,59 @@ def test_open_calls_are_resolved_in_order_from_their_own_status(log):
     session = Session.create(log, FakeModel([reply]), effects.tools(),
                              approver=ScriptedApprover([Decision("approve")]))
     with pytest.raises(Crash):
-        session.run_turn("go")
+        await session.run_turn("go")
 
     resumed = Session.open(log, session.session_id, FakeModel([say("done")]), effects.tools())
-    resumed.resume()
-    assert effects.ran == ["read", "send", "read"]  # c1 once, c2 not repeated, c3 run now
+    await resumed.resume()
+    assert effects.ran.count("send") == 1
+    assert 2 <= effects.ran.count("read") <= 4
     results = {m.tool_call_id: m.text for m in resumed.state.messages if m.role == "tool"}
     assert results == {"c1": "contents of a", "c2": INTERRUPTED_RESULT, "c3": "contents of b"}
 
 
-def test_denial_during_resume_stops_the_turn(log):
+async def test_denial_during_resume_stops_the_turn(log):
     effects = Effects()
     session = Session.create(log, FakeModel([call("send", text="hi")]), effects.tools(),
                              approver=CrashingApprover())
     with pytest.raises(Crash):
-        session.run_turn("send hi")
+        await session.run_turn("send hi")
 
     resumed = Session.open(log, session.session_id, FakeModel([]), effects.tools(),
                            approver=ScriptedApprover([Decision("deny")]))
-    result = resumed.resume()
+    result = await resumed.resume()
     assert result.denied_call.name == "send" and effects.ran == []
     assert not resumed.needs_resume
 
 
-def test_nothing_to_resume_after_a_completed_turn(log):
+async def test_nothing_to_resume_after_a_completed_turn(log):
     session = Session.create(log, FakeModel([say("hello")]), ToolRegistry([]))
-    session.run_turn("hi")
+    await session.run_turn("hi")
 
     reopened = Session.open(log, session.session_id, FakeModel([]), ToolRegistry([]))
     assert not reopened.needs_resume
-    assert reopened.resume() is None
+    assert await reopened.resume() is None
 
 
-def test_new_turn_is_refused_until_resumed_then_allowed(log):
+async def test_new_turn_is_refused_until_resumed_then_allowed(log):
     session = Session.create(log, CrashingModel([CRASH]), ToolRegistry([]))
     with pytest.raises(Crash):
-        session.run_turn("hi")
+        await session.run_turn("hi")
 
     resumed = Session.open(log, session.session_id, FakeModel([say("hello"), say("again")]), ToolRegistry([]))
     with pytest.raises(TurnInProgress):
-        resumed.run_turn("are you there?")
-    resumed.resume()
-    assert resumed.run_turn("are you there?").text == "again"
+        await resumed.run_turn("are you there?")
+    await resumed.resume()
+    assert (await resumed.run_turn("are you there?")).text == "again"
 
 
-def test_live_state_equals_replay_after_resume(log):
+async def test_live_state_equals_replay_after_resume(log):
     effects = Effects(crash_in="send", crash_after_effect=True)
     session = Session.create(log, FakeModel([call("send", text="hi")]), effects.tools(),
                              approver=AutoApprove())
     with pytest.raises(Crash):
-        session.run_turn("send hi")
+        await session.run_turn("send hi")
     resumed = Session.open(log, session.session_id, FakeModel([say("ok")]), effects.tools())
-    resumed.resume()
+    await resumed.resume()
 
     assert resumed.state == project(log.load(session.session_id))
 
@@ -194,11 +199,11 @@ CRASH = object()  # put in a CrashingModel script to crash on that model call
 class CrashingModel(FakeModel):
     """FakeModel that raises Crash when it reaches a CRASH entry in its script."""
 
-    def complete(self, system, messages, tools):
+    async def complete(self, system, messages, tools):
         if self.replies and self.replies[0] is CRASH:
             self.replies.pop(0)
             raise Crash()
-        return super().complete(system, messages, tools)
+        return await super().complete(system, messages, tools)
 
 
 class Effects:
@@ -240,7 +245,7 @@ class ScriptedApprover:
         self.decisions = list(decisions)
         self.asked = []
 
-    def ask(self, call):
+    async def ask(self, call):
         self.asked.append(call)
         if not self.decisions:
             raise AssertionError(f"approver asked about {call.name} unexpectedly")
@@ -248,7 +253,7 @@ class ScriptedApprover:
 
 
 class CrashingApprover:
-    def ask(self, call):
+    async def ask(self, call):
         raise Crash()
 
 
