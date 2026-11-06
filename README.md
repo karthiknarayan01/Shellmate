@@ -5,11 +5,6 @@
 **An AI assistant in your terminal that works on your files and searches the web.**<br>
 Free and private on your own computer, or with Claude and DeepSeek.
 
-[![tests](https://github.com/karthiknarayan01/shellmate/actions/workflows/tests.yml/badge.svg)](https://github.com/karthiknarayan01/shellmate/actions/workflows/tests.yml)
-![python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![models](https://img.shields.io/badge/models-Qwen%20·%20Claude%20·%20DeepSeek-8A2BE2)
-![web search](https://img.shields.io/badge/web%20search-free%2C%20no%20key-2EA44F)
-
 <!-- ![Shellmate answering a question](docs/images/hero.png) -->
 
 </div>
