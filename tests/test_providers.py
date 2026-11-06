@@ -5,6 +5,7 @@ import pytest
 from runtime.anthropic_model import AnthropicModel
 from runtime.deepseek_model import DEFAULT_MODEL, DeepSeekModel
 from runtime.model import DEFAULT_MAX_TOKENS
+from runtime.ollama_model import OllamaModel
 from runtime.providers import make_model
 
 
@@ -48,3 +49,16 @@ def test_bad_env_value_is_rejected(monkeypatch, raw, error):
 def test_unknown_provider():
     with pytest.raises(ValueError, match="unknown provider"):
         make_model("nope")
+
+
+def test_ollama_needs_no_key_and_uses_qwen_by_default(monkeypatch):
+    monkeypatch.delenv("AGENT_CONTEXT_WINDOW", raising=False)
+    model = make_model("ollama")
+    assert isinstance(model, OllamaModel)
+    assert model._model == "qwen3.5:9b"
+    assert model.context_window == 32768
+
+
+def test_ollama_window_comes_from_env(monkeypatch):
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW", "65536")
+    assert make_model("ollama", "qwen3.5:27b").context_window == 65536

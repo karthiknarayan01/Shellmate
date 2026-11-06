@@ -198,6 +198,22 @@ def test_status_shows_the_session_and_context(tmp_path, monkeypatch):
     assert "web_search" in out
 
 
+def test_local_model_is_checked_before_the_chat_starts(tmp_path, monkeypatch):
+    model = LocalModel([], check_error=ModelError("the model qwen3.5:9b isn't downloaded; run: ollama pull qwen3.5:9b"))
+    _use_model(monkeypatch, model)
+    with pytest.raises(SystemExit, match="run: ollama pull qwen3.5:9b"):
+        _run(tmp_path, ["--provider", "ollama"], ["hi"])
+    assert model.requests == []
+
+
+def test_local_model_runs_and_compaction_uses_its_window(tmp_path, monkeypatch):
+    _use_model(monkeypatch, LocalModel([say("hello from qwen")]))
+    out = _run(tmp_path, ["--provider", "ollama"], ["hi", "/status"])
+    assert "qwen3.5:9b (ollama)" in out
+    assert "hello from qwen" in out
+    assert "% of 32,768 tokens" in out
+
+
 def test_new_starts_a_fresh_session(tmp_path, monkeypatch):
     model = FakeModel([say("one"), say("two")])
     _use_model(monkeypatch, model)
@@ -241,6 +257,20 @@ class FlakyModel(FakeModel):
             self.fail_times -= 1
             raise ModelError("Anthropic API error: overloaded")
         return await super().complete(system, messages, tools, on_delta)
+
+
+class LocalModel(FakeModel):
+    """A local model: it has a known context window and a startup check."""
+
+    context_window = 32_768
+
+    def __init__(self, replies, check_error=None):
+        super().__init__(replies=replies)
+        self.check_error = check_error
+
+    async def check(self):
+        if self.check_error is not None:
+            raise self.check_error
 
 
 def _use_model(monkeypatch, model):

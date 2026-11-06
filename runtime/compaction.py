@@ -61,16 +61,22 @@ class CompactionPolicy:
 
 def policy_from_env() -> CompactionPolicy:
     """The default policy, with the context window from AGENT_CONTEXT_WINDOW when set."""
+    window = context_window_from_env()
+    return CompactionPolicy() if window is None else CompactionPolicy(context_window=window)
+
+
+def context_window_from_env() -> int | None:
+    """AGENT_CONTEXT_WINDOW as an integer of at least 1000, or None when unset."""
     raw = os.environ.get(CONTEXT_WINDOW_ENV, "").strip()
     if not raw:
-        return CompactionPolicy()
+        return None
     try:
         window = int(raw)
     except ValueError:
         raise ValueError(f"{CONTEXT_WINDOW_ENV} must be an integer, got {raw!r}") from None
     if window < 1_000:
         raise ValueError(f"{CONTEXT_WINDOW_ENV} must be at least 1000, got {window}")
-    return CompactionPolicy(context_window=window)
+    return window
 
 
 def estimate_tokens(state: SessionState, system: str, tools: list[ToolSpec]) -> int:

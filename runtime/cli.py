@@ -2,6 +2,7 @@
 
     agent-runtime                              new session, Anthropic, workspace = current dir
     agent-runtime --provider deepseek          use DeepSeek
+    agent-runtime --provider ollama            a model on this computer (default qwen3.5:9b)
     agent-runtime --resume latest              continue the most recent session
     agent-runtime --resume <session id>        continue a specific session
     agent-runtime --yes                        approve every tool without asking
@@ -41,12 +42,12 @@ from rich.table import Table
 from rich.text import Text
 
 from runtime.approval import Approver, AutoApprove
-from runtime.compaction import estimate_tokens
+from runtime.compaction import CompactionPolicy, estimate_tokens
 from runtime.events import EventLog
 from runtime.migrate import migrate
 from runtime.model import ModelClient, ModelError
 from runtime.prompts import system_prompt
-from runtime.providers import DEFAULT_MODELS, PROVIDERS, make_model
+from runtime.providers import DEFAULT_MODELS, LOCAL_PROVIDERS, PROVIDERS, make_model
 from runtime.session import (
     CompactionFailed,
     MaxStepsReached,
@@ -137,6 +138,11 @@ async def run_chat(args: argparse.Namespace, console: Console, read: Callable[[s
     """Set up the chat, finish an interrupted turn if there is one, then take messages."""
     with EventLog(args.db) as log:
         chat = make_chat(args, console, read, log)
+        if args.provider in LOCAL_PROVIDERS:
+            try:
+                await chat.model.check()
+            except ModelError as e:
+                raise SystemExit(str(e)) from None
         chat.terminal.catch_ctrl_c()
         show_welcome(chat)
         if chat.session.needs_resume:
@@ -167,6 +173,10 @@ def make_chat(args: argparse.Namespace, console: Console, read, log: EventLog) -
     )
     approver: Approver = AutoApprove() if args.yes else TerminalApprover(chat.terminal, console, workspace)
     chat.options = {"approver": approver, "system_prompt": system_prompt(date.today(), web)}
+    window = getattr(model, "context_window", None)
+    if window is not None:
+        # The model knows its own window (a local model is told its size), so compact against it.
+        chat.options["compaction"] = CompactionPolicy(context_window=window)
     chat.terminal.toolbar = lambda: _toolbar(chat)
     if args.resume is None:
         chat.new_session()
