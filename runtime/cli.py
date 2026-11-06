@@ -16,8 +16,15 @@ something ask in the terminal first.
 
 The session id is printed so it can be resumed later.
 
-The chat runs on one asyncio event loop. Terminal input is read by a single background thread
-(see Terminal), and Ctrl+C cancels whichever task is running: the turn, or the prompt.
+The chat runs on one asyncio event loop. For each message it starts two tasks:
+
+    turn task     session.run_turn(text): the agent loop
+    display task  follows session.subscribe() and prints each event worth showing
+                  (tool runs, errors, skips, compactions, the model's text)
+
+The final answer is simply the last event the display prints; then control returns to the
+prompt. Terminal input is read by a single background thread (see Terminal), and Ctrl+C
+cancels whichever task is running: the turn, or the prompt.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from runtime.session import (
     TurnInProgress,
     TurnResult,
 )
+from runtime.subscriptions import EventStream
 from runtime.tools import ToolRegistry
 from runtime.workspace_tools import workspace_tools
 
@@ -108,7 +116,6 @@ def open_session(log: EventLog, args: argparse.Namespace, terminal: Terminal, ou
         if session_id is None or not log.has_session(session_id):
             raise SystemExit(f"no session to resume: {args.resume}")
         session = Session.open(log, session_id, model, tools, approver=approver)
-    session.observer = lambda event: show_event(event, session, out)
     return session
 
 
@@ -136,42 +143,65 @@ async def run_and_show(
     terminal: Terminal,
     out: TextIO,
 ) -> None:
-    """Run a turn and print its answer. Turn-level errors are printed, not raised."""
-    try:
-        result = await terminal.cancellable(run())
-    except (asyncio.CancelledError, Interrupted, EOFError):
-        session.cancel()
-        print("\n[turn cancelled]", file=out)
-        return
-    except (MaxStepsReached, ReplyTruncated, CompactionFailed) as e:
-        print(f"\n[turn stopped: {e}]", file=out)
-        return
-    except ModelError as e:
-        print(f"\n[{e}]\n[the turn is kept; type {RESUME_COMMAND} to retry it]", file=out)
-        return
-    except TurnInProgress:
-        print(f"\n[the last turn didn't finish; type {RESUME_COMMAND} to retry it]", file=out)
-        return
-    if result is None:
-        return
-    if result.text:
-        print(f"\nassistant> {result.text}", file=out)
-    if result.denied_call is not None:
-        print(f"[stopped: you denied {result.denied_call.name}]", file=out)
+    """Run a turn while a display task prints its events as they are recorded.
+
+    The turn's outcome note (cancelled, stopped, denied) is printed after the display has caught
+    up, so it always comes after the turn's last progress line.
+    """
+    note = None
+    async with session.subscribe() as events:
+        display = asyncio.create_task(show_events(events, session, out))
+        terminal.follow(events)
+        try:
+            result = await terminal.cancellable(run())
+            if result is not None and result.denied_call is not None:
+                note = f"[stopped: you denied {result.denied_call.name}]"
+        except (asyncio.CancelledError, Interrupted, EOFError):
+            session.cancel()
+            note = "[turn cancelled]"
+        except (MaxStepsReached, ReplyTruncated, CompactionFailed) as e:
+            note = f"[turn stopped: {e}]"
+        except ModelError as e:
+            note = f"[{e}]\n[the turn is kept; type {RESUME_COMMAND} to retry it]"
+        except TurnInProgress:
+            note = f"[the last turn didn't finish; type {RESUME_COMMAND} to retry it]"
+        finally:
+            terminal.follow(None)
+            events.close()
+            await display
+    if note:
+        print(f"\n{note}", file=out)
 
 
-def show_event(event: Event, session: Session, out: TextIO) -> None:
-    """One line of progress for the events worth showing while a turn runs."""
-    if event.type == "tool_started":
+async def show_events(events: EventStream, session: Session, out: TextIO) -> None:
+    """The display task: print each event worth showing, until the stream is closed."""
+    async for event in events:
+        line = describe(event, session)
+        if line is not None:
+            print(line, file=out)
+
+
+def describe(event: Event, session: Session) -> str | None:
+    """What to show the user for one event, or None to show nothing.
+
+    Shown: the model's text (a final answer, or what it says before calling tools), each tool
+    call as it starts, tool errors, skipped calls and compactions. Not shown: bookkeeping such
+    as approval records, successful tool results and the turn's own start and end.
+    """
+    if event.type == "assistant_message" and event.payload.get("text"):
+        return f"\nassistant> {event.payload['text']}"
+    if event.type in ("tool_started", "tool_restarted"):
         call = session.state.tool_calls[event.payload["call_id"]].call
         arguments = ", ".join(f"{k}={_shorten(v, 60)}" for k, v in call.arguments.items())
-        print(f"  -> {call.name}({arguments})", file=out)
-    elif event.type == "tool_finished" and event.payload.get("is_error"):
-        print(f"  ! {_first_line(event.payload['output'])}", file=out)
-    elif event.type == "tool_skipped":
-        print(f"  - skipped: {_first_line(event.payload['reason'])}", file=out)
-    elif event.type == "compaction":
-        print(f"  [compacted {event.payload['replaced_count']} earlier messages]", file=out)
+        again = " (again, after a crash)" if event.type == "tool_restarted" else ""
+        return f"  -> {call.name}({arguments}){again}"
+    if event.type == "tool_finished" and event.payload.get("is_error"):
+        return f"  ! {_first_line(event.payload['output'])}"
+    if event.type == "tool_skipped":
+        return f"  - skipped: {_first_line(event.payload['reason'])}"
+    if event.type == "compaction":
+        return f"  [compacted {event.payload['replaced_count']} earlier messages]"
+    return None
 
 
 class TerminalApprover:
@@ -188,6 +218,7 @@ class TerminalApprover:
         self.out = out
 
     async def ask(self, call: ToolCall) -> Decision:
+        await self.terminal.caught_up()
         print(f"\n{call.name} wants to run with:", file=self.out)
         for name, value in call.arguments.items():
             print(f"  {name}: {_shorten(value)}", file=self.out)
@@ -229,6 +260,7 @@ class Terminal:
         self._read_outstanding = False
         self._input_closed = False
         self._current: asyncio.Task | None = None
+        self._followed: EventStream | None = None
 
     def catch_ctrl_c(self) -> None:
         """Make Ctrl+C cancel the current task. Not available on every platform; then it quits."""
@@ -236,6 +268,15 @@ class Terminal:
             asyncio.get_running_loop().add_signal_handler(signal.SIGINT, self._cancel_current)
         except (NotImplementedError, RuntimeError, ValueError):
             pass
+
+    def follow(self, events: EventStream | None) -> None:
+        """The event stream the display is printing, so prompts can wait for it (caught_up)."""
+        self._followed = events
+
+    async def caught_up(self) -> None:
+        """Wait until the display has printed every event so far, so a prompt comes after them."""
+        if self._followed is not None:
+            await self._followed.drained()
 
     async def cancellable(self, work: Awaitable):
         """Run `work` as the task Ctrl+C cancels."""

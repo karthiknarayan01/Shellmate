@@ -32,14 +32,15 @@ its side effect happened before the crash.
 
 Everything runs on one asyncio event loop in one thread. Model requests and tool calls are
 awaited, so while they wait on the network or a worker thread, other tool calls make progress.
-Events are only ever written from the loop, so the log still has a single writer.
+Events are only ever written from the loop, so the log still has a single writer. Each one is
+then published to subscribers (subscribe()), which is how a UI follows a turn while it runs.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from runtime.approval import Approver, Decision, DenyAll
 from runtime.compaction import (
@@ -51,10 +52,11 @@ from runtime.compaction import (
     render_transcript,
     summary_message_text,
 )
-from runtime.events import Event, EventLog
+from runtime.events import EventLog
 from runtime.messages import Message, ToolCall
 from runtime.model import ModelClient
 from runtime.state import SessionState, ToolCallState, ToolCallStatus, apply, project
+from runtime.subscriptions import EventHub, EventStream
 from runtime.tools import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -107,13 +109,11 @@ class Session:
         max_steps: int = 20,
         max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
         compaction: CompactionPolicy | None = None,
-        observer: Callable[[Event], None] | None = None,
     ):
         """Use Session.create() or Session.open() rather than calling this directly.
 
         Without an approver, every tool that requires approval is denied. Without a compaction
-        policy, the context window comes from AGENT_CONTEXT_WINDOW or the default. `observer`
-        is called with every event right after it is recorded (a UI uses it to show progress).
+        policy, the context window comes from AGENT_CONTEXT_WINDOW or the default.
         """
         self.log = log
         self.session_id = session_id
@@ -125,7 +125,7 @@ class Session:
         self.max_steps = max_steps
         self.max_parallel_tools = max_parallel_tools
         self.compaction = compaction or policy_from_env()
-        self.observer = observer
+        self._hub = EventHub()
 
     @classmethod
     def create(cls, log: EventLog, model: ModelClient, tools: ToolRegistry, **options: Any) -> Session:
@@ -141,6 +141,13 @@ class Session:
         If `needs_resume` is True afterwards, call resume() before the next run_turn().
         """
         return cls(log, session_id, project(log.load(session_id)), model, tools, **options)
+
+    def subscribe(self) -> EventStream:
+        """Follow the session live: a stream of every event recorded from now on.
+
+        Use as `async with session.subscribe() as events: async for event in events: ...`
+        """
+        return self._hub.subscribe()
 
     @property
     def needs_resume(self) -> bool:
@@ -354,8 +361,7 @@ class Session:
         return TurnResult(last_text, denied_call=denied)
 
     def _record(self, type: str, payload: dict[str, Any]) -> None:
-        """Append the event (durable once this returns), fold it into the state, tell the observer."""
+        """Append the event (durable once this returns), fold it into the state, publish it."""
         event = self.log.append(self.session_id, type, payload)
         apply(self.state, event)
-        if self.observer is not None:
-            self.observer(event)
+        self._hub.publish(event)

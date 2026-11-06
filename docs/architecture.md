@@ -39,6 +39,7 @@ Fig. 1  One running agent-runtime
  │                                                                                  │
  │  worker threads (asyncio.to_thread): run plain-function tools                    │
  │  input thread: reads terminal lines, one per prompt                              │
+ │  display task (on the loop): follows session.subscribe(), prints progress        │
  └─────────────────────────────┼─────────┼───────────────────────────────┼──────────┘
                                ▼         ▼                               ▼
                        agent.db (SQLite, WAL)   workspace        api.anthropic.com
@@ -64,6 +65,7 @@ The rest of this document follows from that split.
 | `runtime/messages.py` | `Message`, `ToolCall`: the conversation, independent of any provider |
 | `runtime/state.py` | `project()` / `apply()`: fold events into `SessionState` |
 | `runtime/session.py` | `Session`: the agent loop, approvals, resume, cancel |
+| `runtime/subscriptions.py` | `EventHub`, `EventStream`: follow a session's events live |
 | `runtime/compaction.py` | when and how to summarize old messages |
 | `runtime/model.py` | the `ModelClient` interface and its reply type |
 | `runtime/anthropic_model.py`, `runtime/deepseek_model.py` | the two provider adapters |
@@ -176,7 +178,7 @@ Fig. 4  A turn: "read config.py and fix the typo"
                                               turn_open = False → return TurnResult
 ```
 
-Every arrow labelled "record" goes through `Session._record`: append the event to the log, apply it to `SessionState`, then call the observer (the CLI prints progress from it). Writing to the log first is what makes the rest safe: if the process dies between the append and the update in memory, the restarted process rebuilds memory from the log anyway.
+Every arrow labelled "record" goes through `Session._record`: append the event to the log, apply it to `SessionState`, then publish it to subscribers (§5.2). Writing to the log first is what makes the rest safe: if the process dies between the append and the update in memory, the restarted process rebuilds memory from the log anyway.
 
 The events this turn leaves in the log:
 
@@ -226,6 +228,28 @@ Fig. 5  One reply with three calls: search(a), search(b), write_file(c)
 - **If one call is interrupted** (the turn is cancelled, or a crash in the process), the others are cancelled too. A thread can't be stopped from outside, so a plain-function tool that was mid-run finishes in the background; the log marks it interrupted, which is the same rule as after a crash (§7).
 
 The speed-up is for tools that wait: network requests, subprocesses, slow disks. The model request itself is still one call at a time, and local file tools take milliseconds either way.
+
+### 5.2 Following a turn while it runs
+
+A UI doesn't wait for `run_turn` to return. It subscribes to the session and is handed every event the moment it is recorded:
+
+```
+Fig. 6  Two tasks on the event loop during one turn
+
+ turn task                                         display task
+ ─────────                                         ────────────
+ session.run_turn("…")                             async for event in session.subscribe():
+   _record(assistant_message "Let me look")  ──►       print "assistant> Let me look"
+   _record(tool_started read_file)           ──►       print "  -> read_file(path=a.py)"
+   await tools.execute()       (waiting…)              (nothing to print)
+   _record(tool_finished)                    ──►       (a success: nothing to print)
+   _record(assistant_message "Done.")        ──►       print "assistant> Done."
+ returns TurnResult                                stream closed → loop ends
+```
+
+`subscriptions.py: EventHub.publish` puts the event on every subscriber's own queue and returns at once, so a slow UI can't slow the turn, and the session doesn't know who is listening. An event is published after it is in the log and in `SessionState`, so a subscriber that looks at the state sees it up to date. A subscriber only receives events recorded after it subscribed; to show history, replay the log.
+
+A subscriber can wait until it has handled everything published so far (`EventStream.drained()`). The CLI's approval prompt uses this so that it appears after the progress lines that led to it, not before them.
 
 ## 6. Approvals
 
@@ -315,7 +339,7 @@ With the defaults, compaction starts at about 102,400 tokens and keeps about 32,
 - at least one message is kept and at least one summarized.
 
 ```
-Fig. 6  Cutting a history of 9 messages
+Fig. 7  Cutting a history of 9 messages
 
  index   0      1         2      3         4      5         6      7         8
  role    user   asst      tool   asst      tool   asst      tool   asst      tool
@@ -374,7 +398,7 @@ To give an agent other tools, build a `ToolRegistry` from your own `Tool`s and p
 
 ## 11. The command-line chat
 
-`cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, `run_turn`, print the answer. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
+`cli.py: main` migrates the database, opens or creates the session (`--resume`), finishes an interrupted turn if there is one, then loops: read a line, run the turn. Each turn runs as one task while a display task follows `session.subscribe()` and prints what `describe(event)` says is worth showing: the model's text (including what it says before calling tools), each tool call as it starts, tool errors, skipped calls and compactions. The final answer is just the last of those lines; then control returns to the prompt. `TerminalApprover` shows the tool's arguments and parses `y` / `a` / `n` / free text. Turn-level errors (`MaxStepsReached`, `ReplyTruncated`, `CompactionFailed`, `ModelError`) are printed and the chat continues; after a `ModelError`, `/resume` retries the turn.
 
 Two details come from running on an event loop. Terminal input is read by one background thread, one line per prompt, and handed to the loop through a queue: a prompt abandoned with Ctrl+C leaves its read outstanding, and that read answers the next prompt instead of a second reader swallowing a line. Ctrl+C is installed as a signal handler that cancels whatever task is running (the turn, or the wait at a prompt), so it never stops the loop itself; a cancelled turn is then ended with `Session.cancel()`.
 
@@ -390,12 +414,14 @@ The tests that check the central guarantees:
 | killing the process inside a tool, during approval, or during a model call, then resuming, leaves the side effect done exactly once | `test_crash_resume.py` (real SIGKILL of a child process) |
 | a denied tool never runs | `test_session_approvals.py` |
 | calls from one reply run at the same time, approvals first, at most `max_parallel_tools` | `test_session_parallel_tools.py` |
+| a subscriber sees each event while the turn is still running; one that never reads doesn't block it | `test_subscriptions.py` |
 | a 100-step turn compacts repeatedly and still answers the original question | `test_session_compaction.py` |
 | the live state always equals a replay of the log | in `test_session*.py` |
 
 ## 13. Limits
 
 - **One process per session.** Nothing stops two processes from opening the same session at once; they would interleave events. Run one at a time.
-- **No streaming.** Replies arrive whole, which also caps Anthropic requests at 21,333 output tokens.
+- **No token streaming.** Events reach subscribers as they happen, but each model reply arrives whole, so its text appears all at once. That also caps Anthropic requests at 21,333 output tokens.
+- **Subscriber queues are unbounded.** A subscriber that stops reading keeps every event in memory until it is closed.
 - **Token estimates are rough** (four characters per token) for messages the provider hasn't counted yet. The trigger leaves 20% headroom for that.
 - **The context window default is conservative.** Set `AGENT_CONTEXT_WINDOW` to your model's real window so it doesn't compact earlier than needed.

@@ -12,7 +12,7 @@ from runtime.approval import Decision
 from runtime.events import EventLog
 from runtime.messages import ToolCall
 from runtime.migrate import migrate
-from runtime.model import ModelError
+from runtime.model import ModelError, ModelReply
 from tests.fake_model import FakeModel, call, say
 
 
@@ -79,6 +79,23 @@ def test_denied_write_never_runs(tmp_path, monkeypatch):
 
     assert "[stopped: you denied write_file]" in out
     assert not (workspace / "a.txt").exists()
+
+
+def test_progress_lines_come_before_the_approval_prompt(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    narrate_and_write = ModelReply(
+        text="I'll create the file.",
+        tool_calls=(ToolCall("c1", "write_file", {"path": "a.txt", "content": "hi"}),),
+    )
+    _use_model(monkeypatch, FakeModel([narrate_and_write, say("written")]))
+    out = _run(tmp_path, ["--workspace", str(workspace)], ["write a.txt", "y"])
+
+    narration = out.index("assistant> I'll create the file.")
+    prompt = out.index("write_file wants to run with:")
+    started = out.index("-> write_file(")
+    answer = out.index("assistant> written")
+    assert narration < prompt < started < answer
 
 
 def test_yes_flag_approves_without_asking(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-"""Session.cancel(), which ends an interrupted turn without running anything more, and the observer."""
+"""Session.cancel(), which ends an interrupted turn without running anything more."""
 
 import pytest
 
@@ -64,14 +64,6 @@ async def test_cancel_with_no_open_turn_does_nothing(log):
     before = _types(log, session)
     session.cancel()
     assert _types(log, session) == before
-
-
-async def test_observer_sees_every_recorded_event_in_order(log):
-    seen = []
-    session = Session.create(log, FakeModel([call("slow"), say("done")]), _tools(),
-                             observer=lambda event: seen.append(event.type))
-    await session.run_turn("go")
-    assert seen == _types(log, session)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
