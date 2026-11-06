@@ -1,0 +1,27 @@
+# Merge gate: a PR passes this check only while it carries the "approved" label.
+# Any new commit pushed to the PR removes the label, so approval always applies to the
+# latest code. Only people with write access can add labels.
+name: approval
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  approved:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drop approval after new commits
+        if: github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'approved')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr edit ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --remove-label approved
+
+      - name: Require the approved label
+        if: github.event.action == 'synchronize' || !contains(github.event.pull_request.labels.*.name, 'approved')
+        run: |
+          echo "Add the 'approved' label to this PR once it has been reviewed."
+          exit 1
