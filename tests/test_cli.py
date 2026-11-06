@@ -1,14 +1,15 @@
-"""The command-line chat, driven with scripted input and a fake model."""
+"""The command-line chat end to end, driven with scripted input and a fake model.
 
-import asyncio
+Output goes to a StringIO, which rich treats as a plain file: no colors, and nothing transient
+(spinners), so these tests read the same text a user would see, minus the styling.
+"""
+
 import io
-import threading
 
 import pytest
 
 from runtime import cli
-from runtime.cli import Terminal, TerminalApprover, main, parse_answer
-from runtime.approval import Decision
+from runtime.cli import main
 from runtime.events import EventLog
 from runtime.messages import ToolCall
 from runtime.migrate import migrate
@@ -16,11 +17,19 @@ from runtime.model import ModelError, ModelReply
 from tests.fake_model import FakeModel, call, say
 
 
-def test_chat_runs_a_turn_and_prints_the_answer(tmp_path, monkeypatch):
+def test_welcome_panel_then_a_turn_and_its_answer(tmp_path, monkeypatch):
     _use_model(monkeypatch, FakeModel([say("hello there")]))
     out = _run(tmp_path, [], ["hi"])
-    assert "assistant> hello there" in out
-    assert "session " in out
+    assert "agent-runtime" in out and "claude-sonnet-5-5 (anthropic)" in out
+    assert "(new)" in out and "/help for commands" in out
+    assert "hello there" in out
+
+
+def test_each_turn_ends_with_a_cost_line(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([say("ok")]))
+    out = _run(tmp_path, [], ["hi"])
+    cost = [line for line in out.splitlines() if "claude-sonnet-5-5 ·" in line]
+    assert cost and "context" in cost[-1] and cost[-1].rstrip().endswith("s")
 
 
 def test_fresh_database_is_migrated_on_start(tmp_path, monkeypatch):
@@ -37,7 +46,7 @@ def test_resume_latest_continues_the_conversation(tmp_path, monkeypatch):
     model = FakeModel([say("two")])
     _use_model(monkeypatch, model)
     out = _run(tmp_path, ["--resume", "latest"], ["second"])
-    assert "assistant> two" in out
+    assert "(resumed, 2 messages)" in out and "two" in out
     assert [m.text for m in model.requests[0].messages] == ["first", "one", "second"]
 
 
@@ -57,61 +66,60 @@ def test_interrupted_turn_is_finished_on_start(tmp_path, monkeypatch):
     _use_model(monkeypatch, FakeModel([say("sorry for the wait")]))
     out = _run(tmp_path, ["--resume", sid], [])
     assert "Finishing the turn that was interrupted" in out
-    assert "assistant> sorry for the wait" in out
+    assert "sorry for the wait" in out
 
 
 def test_write_asks_for_approval_and_runs_on_yes(tmp_path, monkeypatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    workspace = _workspace(tmp_path)
     _use_model(monkeypatch, FakeModel([call("write_file", path="a.txt", content="hi"), say("written")]))
     out = _run(tmp_path, ["--workspace", str(workspace)], ["write a.txt", "y"])
 
-    assert "write_file wants to run with:" in out and "path: a.txt" in out
-    assert "-> write_file(path=a.txt, content=hi)" in out
+    assert "Allow write_file?" in out and "new file, 1 line" in out
+    assert "● write_file  path=a.txt  content=hi" in out
+    assert "⎿  wrote 2 characters to a.txt" in out
     assert (workspace / "a.txt").read_text() == "hi"
 
 
 def test_denied_write_never_runs(tmp_path, monkeypatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    workspace = _workspace(tmp_path)
     _use_model(monkeypatch, FakeModel([call("write_file", path="a.txt", content="hi")]))
     out = _run(tmp_path, ["--workspace", str(workspace)], ["write a.txt", "n"])
 
-    assert "[stopped: you denied write_file]" in out
+    assert "Stopped: you denied write_file." in out
     assert not (workspace / "a.txt").exists()
 
 
-def test_progress_lines_come_before_the_approval_prompt(tmp_path, monkeypatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+def test_work_is_shown_in_the_order_it_happens(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
     narrate_and_write = ModelReply(
         text="I'll create the file.",
         tool_calls=(ToolCall("c1", "write_file", {"path": "a.txt", "content": "hi"}),),
     )
-    _use_model(monkeypatch, FakeModel([narrate_and_write, say("written")]))
+    _use_model(monkeypatch, FakeModel([narrate_and_write, say("All written.")]))
     out = _run(tmp_path, ["--workspace", str(workspace)], ["write a.txt", "y"])
 
-    narration = out.index("assistant> I'll create the file.")
-    prompt = out.index("write_file wants to run with:")
-    started = out.index("-> write_file(")
-    answer = out.index("assistant> written")
-    assert narration < prompt < started < answer
+    order = [out.index(s) for s in ("I'll create the file.", "Allow write_file?", "● write_file", "All written.")]
+    assert order == sorted(order)
 
 
-def test_streamed_answer_is_printed_once(tmp_path, monkeypatch):
+def test_streamed_answer_is_shown_once(tmp_path, monkeypatch):
     _use_model(monkeypatch, FakeModel([say("one two three four five six seven")]))
     out = _run(tmp_path, [], ["count"])
     assert out.count("one two three four five six seven") == 1
-    assert "assistant> one two three four five six seven\n" in out
 
 
-def test_thinking_is_shown_once_while_the_model_reasons(tmp_path, monkeypatch):
+def test_reasoning_is_not_printed(tmp_path, monkeypatch):
     reply = ModelReply(text="42", reasoning="let me think about this carefully for a moment")
     _use_model(monkeypatch, FakeModel([reply]))
     out = _run(tmp_path, [], ["what is the answer?"])
-    assert out.count("(thinking...)") == 1
-    assert out.index("(thinking...)") < out.index("assistant> 42")
-    assert "carefully" not in out  # the reasoning itself isn't printed
+    assert "42" in out and "carefully" not in out
+
+
+def test_markdown_in_answers_is_rendered(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([say("Use **bold** and `code`.\n\n- one\n- two")]))
+    out = _run(tmp_path, [], ["format"])
+    assert "**" not in out and "bold" in out
+    assert "• one" in out and "• two" in out
 
 
 def test_web_tools_and_a_dated_prompt_are_given_to_the_model(tmp_path, monkeypatch):
@@ -126,30 +134,28 @@ def test_web_tools_and_a_dated_prompt_are_given_to_the_model(tmp_path, monkeypat
 def test_no_web_flag_removes_the_web_tools(tmp_path, monkeypatch):
     model = FakeModel([say("ok")])
     _use_model(monkeypatch, model)
-    _run(tmp_path, ["--no-web"], ["hi"])
-    request = model.requests[0]
-    assert not {"web_search", "read_web_page"} & {t.name for t in request.tools}
-    assert "web_search" not in request.system
+    out = _run(tmp_path, ["--no-web"], ["hi"])
+    assert not {"web_search", "read_web_page"} & {t.name for t in model.requests[0].tools}
+    assert "web_search" not in model.requests[0].system
+    assert "web search" in out and "off" in out
 
 
 def test_yes_flag_approves_without_asking(tmp_path, monkeypatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    workspace = _workspace(tmp_path)
     _use_model(monkeypatch, FakeModel([call("write_file", path="a.txt", content="hi"), say("done")]))
     out = _run(tmp_path, ["--workspace", str(workspace), "--yes"], ["write a.txt"])
 
-    assert "wants to run" not in out
+    assert "Allow write_file?" not in out and "automatic (--yes)" in out
     assert (workspace / "a.txt").read_text() == "hi"
 
 
 def test_ctrl_c_during_a_turn_cancels_it_and_the_chat_goes_on(tmp_path, monkeypatch):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    workspace = _workspace(tmp_path)
     _use_model(monkeypatch, FakeModel([call("write_file", path="a.txt", content="hi"), say("next answer")]))
     out = _run(tmp_path, ["--workspace", str(workspace)], ["write a.txt", KeyboardInterrupt, "something else"])
 
-    assert "[turn cancelled]" in out
-    assert "assistant> next answer" in out
+    assert "Turn cancelled." in out
+    assert "next answer" in out
     assert not (workspace / "a.txt").exists()
 
 
@@ -157,7 +163,7 @@ def test_turn_errors_are_printed_not_raised(tmp_path, monkeypatch):
     model = FakeModel([call("list_files", call_id=f"c{i}") for i in range(25)])
     _use_model(monkeypatch, model)
     out = _run(tmp_path, ["--workspace", str(tmp_path)], ["loop forever"])
-    assert "[turn stopped: no final answer after 20 steps]" in out
+    assert "Turn stopped: no final answer after 20 steps" in out
 
 
 def test_missing_api_key_is_a_clean_exit(tmp_path, monkeypatch):
@@ -171,71 +177,53 @@ def test_model_api_error_keeps_the_turn_and_resume_retries_it(tmp_path, monkeypa
     _use_model(monkeypatch, model)
     out = _run(tmp_path, [], ["hi", "something else", "/resume"])
 
-    assert "[Anthropic API error: overloaded]" in out
+    assert "Anthropic API error: overloaded" in out
     assert "type /resume to retry it" in out
-    assert "the last turn didn't finish" in out  # "something else" was refused
-    assert "assistant> worked this time" in out
+    assert "The last turn didn't finish" in out  # "something else" was refused
+    assert "worked this time" in out
+
+
+def test_help_lists_the_commands(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([]))
+    out = _run(tmp_path, [], ["/help"])
+    for command in ("/new", "/status", "/resume", "/clear", "/exit", "Ctrl+C", "Alt+Enter"):
+        assert command in out
+
+
+def test_status_shows_the_session_and_context(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([say("ok")]))
+    out = _run(tmp_path, [], ["hi", "/status"])
+    assert "messages" in out and "2" in out
+    assert "% of 128,000 tokens" in out
+    assert "web_search" in out
+
+
+def test_new_starts_a_fresh_session(tmp_path, monkeypatch):
+    model = FakeModel([say("one"), say("two")])
+    _use_model(monkeypatch, model)
+    out = _run(tmp_path, [], ["first", "/new", "second"])
+    assert "New session" in out
+    assert [m.text for m in model.requests[1].messages] == ["second"]
+    with EventLog(str(tmp_path / "agent.db")) as log:
+        assert len({row for row in log._conn.execute("SELECT session_id FROM sessions")}) == 2
+
+
+def test_nothing_to_resume(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([]))
+    assert "Nothing to resume" in _run(tmp_path, [], ["/resume"])
+
+
+def test_unknown_command(tmp_path, monkeypatch):
+    _use_model(monkeypatch, FakeModel([]))
+    assert "Unknown command /nope" in _run(tmp_path, [], ["/nope"])
 
 
 @pytest.mark.parametrize("command", ["/exit", "/quit"])
 def test_exit_commands(tmp_path, monkeypatch, command):
-    _use_model(monkeypatch, FakeModel([]))
-    _run(tmp_path, [], [command, "never read"])
-
-
-@pytest.mark.parametrize(
-    "answer, decision",
-    [
-        ("y", Decision("approve")),
-        ("YES", Decision("approve")),
-        ("a", Decision("approve_for_session")),
-        ("always", Decision("approve_for_session")),
-        ("", Decision("deny")),
-        ("n", Decision("deny")),
-        ("use b.txt instead", Decision("deny", feedback="use b.txt instead")),
-    ],
-)
-def test_answers_map_to_decisions(answer, decision):
-    assert parse_answer(answer) == decision
-
-
-async def test_approver_prompt_shortens_long_arguments():
-    out = io.StringIO()
-    approver = TerminalApprover(Terminal(lambda prompt: "y", out), out)
-    decision = await approver.ask(ToolCall("c1", "write_file", {"path": "a.txt", "content": "x" * 1_000}))
-    assert decision == Decision("approve")
-    assert "(1000 characters)" in out.getvalue()
-
-
-async def test_a_cancelled_prompt_does_not_swallow_the_next_line():
-    """Ctrl+C at a prompt leaves its read outstanding; that read answers the next prompt."""
-    release = threading.Event()
-    reads = []
-
-    def read(_prompt):
-        reads.append(1)
-        release.wait(timeout=5)
-        return "hello"
-
-    terminal = Terminal(read, io.StringIO())
-    first = asyncio.create_task(terminal.ask("> "))
-    await asyncio.sleep(0.05)
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-
-    second = asyncio.create_task(terminal.ask("> "))
-    release.set()
-    assert await second == "hello"
-    assert len(reads) == 1
-
-
-async def test_lines_are_read_only_when_asked_for():
-    reads = []
-    terminal = Terminal(lambda prompt: reads.append(1) or "y", io.StringIO())
-    assert await terminal.ask("> ") == "y"
-    await asyncio.sleep(0.05)
-    assert len(reads) == 1
+    model = FakeModel([])
+    _use_model(monkeypatch, model)
+    _run(tmp_path, [], [command, "never sent"])
+    assert model.requests == []
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
@@ -257,6 +245,12 @@ class FlakyModel(FakeModel):
 
 def _use_model(monkeypatch, model):
     monkeypatch.setattr(cli, "make_model", lambda provider, model_name=None: model)
+
+
+def _workspace(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return workspace
 
 
 def _run(tmp_path, args, inputs):
