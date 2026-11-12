@@ -11,7 +11,7 @@ Free and private on your own computer, or with Claude and DeepSeek.
 
 ---
 
-Shellmate is a small, crash-safe runtime for tool-using AI agents, written from scratch in Python. It runs an agent loop against Anthropic or DeepSeek models, or an open model on your own computer, and records every step in an append-only SQLite log, so:
+Shellmate is a small, crash-safe runtime for tool-using AI agents, written from scratch in Python. It runs an agent loop against Anthropic, OpenAI or DeepSeek models, or an open model on your own computer, and records every step in an append-only SQLite log, so:
 
 | what you get | how |
 |---|---|
@@ -63,6 +63,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 export ANTHROPIC_API_KEY=...      # for --provider anthropic (the default)
 export DEEPSEEK_API_KEY=...       # for --provider deepseek
+export OPENAI_API_KEY=...         # for --provider openai
 agent-runtime
 ```
 
@@ -114,6 +115,7 @@ A dim line after each turn shows the tokens used, how full the context window is
 ```bash
 agent-runtime                          # new session; the tools work in the current directory
 agent-runtime --provider deepseek      # use DeepSeek instead of Anthropic
+agent-runtime --provider openai        # use OpenAI
 agent-runtime --provider ollama        # use a local model through Ollama
 agent-runtime --provider deepseek --model deepseek-flash
                                        # pick a model (defaults below)
@@ -125,7 +127,7 @@ agent-runtime --no-web                 # don't give the agent web search
 agent-runtime --db sessions.db         # keep sessions in another file (default agent.db)
 ```
 
-Default models: `claude-sonnet-5-5` (Anthropic), `deepseek-v4-pro` (DeepSeek), `qwen3.5:9b` (Ollama).
+Default models: `claude-sonnet-5-5` (Anthropic), `gpt-6.1-sol` (OpenAI), `deepseek-v4-pro` (DeepSeek), `qwen3.5:9b` (Ollama).
 
 ## ⚙️ Configuration
 
@@ -133,6 +135,7 @@ Default models: `claude-sonnet-5-5` (Anthropic), `deepseek-v4-pro` (DeepSeek), `
 |---|---|---|
 | `ANTHROPIC_API_KEY` | | key for `--provider anthropic` |
 | `DEEPSEEK_API_KEY` | | key for `--provider deepseek` |
+| `OPENAI_API_KEY` | | key for `--provider openai` |
 | `AGENT_MAX_OUTPUT_TOKENS` | `16000` | output token cap per model request |
 | `AGENT_CONTEXT_WINDOW` | `128000` (`32768` for ollama) | context window used to decide when to compact; set it to your model's real window. For ollama it is also the window the model is run with |
 | `OLLAMA_HOST` | `localhost:11434` | where Ollama is listening |
