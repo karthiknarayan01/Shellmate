@@ -6,12 +6,19 @@ from runtime.anthropic_model import AnthropicModel
 from runtime.deepseek_model import DEFAULT_MODEL, DeepSeekModel
 from runtime.model import DEFAULT_MAX_TOKENS
 from runtime.ollama_model import OllamaModel
+from runtime.openai_model import OpenAIModel
 from runtime.providers import make_model
 
 
 def test_anthropic(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     assert isinstance(make_model("anthropic"), AnthropicModel)
+
+
+def test_openai(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    assert isinstance(make_model("openai"), OpenAIModel)
+    assert make_model("openai", "gpt-6-astra")._model == "gpt-6-astra"
 
 
 def test_deepseek_default_and_chosen_model(monkeypatch):

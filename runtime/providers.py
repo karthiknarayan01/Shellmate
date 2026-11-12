@@ -3,6 +3,7 @@
     make_model("anthropic")            ANTHROPIC_API_KEY, default model claude-sonnet-5-5
     make_model("deepseek")             DEEPSEEK_API_KEY, default model deepseek-v4-pro
     make_model("deepseek", "deepseek-flash")
+    make_model("openai")               OPENAI_API_KEY, default model gpt-6.1-sol
     make_model("ollama")               local, no key, default model qwen3.5:9b
 
 The output token cap per request comes from AGENT_MAX_OUTPUT_TOKENS when set, otherwise
@@ -22,12 +23,20 @@ from runtime.model import DEFAULT_MAX_TOKENS, ModelClient
 from runtime.ollama_model import DEFAULT_CONTEXT_WINDOW as OLLAMA_DEFAULT_CONTEXT_WINDOW
 from runtime.ollama_model import DEFAULT_MODEL as OLLAMA_DEFAULT_MODEL
 from runtime.ollama_model import OllamaModel
+from runtime.openai_model import DEFAULT_MODEL as OPENAI_DEFAULT_MODEL
+from runtime.openai_model import OpenAIModel
 
-PROVIDERS = {"anthropic": AnthropicModel, "deepseek": DeepSeekModel, "ollama": OllamaModel}
+PROVIDERS = {
+    "anthropic": AnthropicModel,
+    "deepseek": DeepSeekModel,
+    "ollama": OllamaModel,
+    "openai": OpenAIModel,
+}
 DEFAULT_MODELS = {
     "anthropic": ANTHROPIC_DEFAULT_MODEL,
     "deepseek": DEEPSEEK_DEFAULT_MODEL,
     "ollama": OLLAMA_DEFAULT_MODEL,
+    "openai": OPENAI_DEFAULT_MODEL,
 }
 LOCAL_PROVIDERS = {"ollama"}
 MAX_TOKENS_ENV = "AGENT_MAX_OUTPUT_TOKENS"

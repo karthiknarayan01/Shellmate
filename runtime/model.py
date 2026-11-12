@@ -1,7 +1,8 @@
 """What the agent loop needs from a language model, independent of provider.
 
 A model client takes the system prompt, the conversation and the tool specs, and returns one
-reply: text, tool calls, or both. Implemented by anthropic_model.py and deepseek_model.py.
+reply: text, tool calls, or both. Implemented by anthropic_model.py, deepseek_model.py,
+openai_model.py and ollama_model.py.
 
 Replies are streamed from the provider. While a reply is being generated, the client calls
 `on_delta` with each piece of text (and of reasoning, for models that return it) as it arrives;
